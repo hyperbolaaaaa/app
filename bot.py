@@ -3,6 +3,7 @@ import queue
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Optional
@@ -22,6 +23,14 @@ try:
     MESSAGE_MAP_SAMPLE_RATE = float(os.getenv("MESSAGE_MAP_SAMPLE_RATE", "1.0"))
 except ValueError:
     MESSAGE_MAP_SAMPLE_RATE = 1.0
+try:
+    SEND_MAX_WORKERS = int(os.getenv("SEND_MAX_WORKERS", "16"))
+except ValueError:
+    SEND_MAX_WORKERS = 16
+try:
+    SEND_RETRIES = int(os.getenv("SEND_RETRIES", "2"))
+except ValueError:
+    SEND_RETRIES = 2
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -202,6 +211,58 @@ def should_store_mapping(sender_id: int) -> bool:
     return True
 
 
+def _retry_after_seconds(error: Exception) -> Optional[float]:
+    wait = getattr(error, "retry_after", None)
+    if wait is not None:
+        try:
+            return float(wait)
+        except (TypeError, ValueError):
+            return None
+    result = getattr(error, "result_json", None)
+    if isinstance(result, dict):
+        params = result.get("parameters", {})
+        retry_after = params.get("retry_after")
+        if retry_after is not None:
+            try:
+                return float(retry_after)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _copy_with_retry(chat_id: int, from_chat_id: int, message_id: int):
+    attempts = max(0, SEND_RETRIES) + 1
+    for attempt in range(attempts):
+        try:
+            return bot.copy_message(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id)
+        except Exception as exc:
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None and attempt < attempts - 1:
+                time.sleep(max(0.05, retry_after))
+                continue
+            if attempt < attempts - 1:
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            return None
+    return None
+
+
+def _send_single_to_user(uid: int, sender: int, src_message_id: int, store_mapping: bool, now: int) -> list[tuple]:
+    sent = _copy_with_retry(chat_id=uid, from_chat_id=sender, message_id=src_message_id)
+    if not sent or not store_mapping:
+        return []
+    return [(sent.message_id, sender, uid, now)]
+
+
+def _send_album_to_user(uid: int, sender: int, msg_ids: list[int], store_mapping: bool, now: int) -> list[tuple]:
+    user_rows: list[tuple] = []
+    for msg_id in msg_ids:
+        sent = _copy_with_retry(chat_id=uid, from_chat_id=sender, message_id=msg_id)
+        if sent and store_mapping:
+            user_rows.append((sent.message_id, sender, uid, now))
+    return user_rows
+
+
 @bot.message_handler(commands=["start"])
 def start_command(message):
     uid = message.chat.id
@@ -260,19 +321,22 @@ def relay_single(message) -> None:
     mappings: list[tuple] = []
     store_mapping = should_store_mapping(sender)
     now = int(time.time())
-    for uid in active_receivers():
-        if uid == sender:
-            continue
-        try:
-            sent = bot.copy_message(
-                chat_id=uid,
-                from_chat_id=sender,
-                message_id=message.message_id,
+    receivers = [uid for uid in active_receivers() if uid != sender]
+    workers = max(1, min(SEND_MAX_WORKERS, len(receivers) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(
+                _send_single_to_user,
+                uid,
+                sender,
+                message.message_id,
+                store_mapping,
+                now,
             )
-            if store_mapping:
-                mappings.append((sent.message_id, sender, uid, now))
-        except Exception:
-            pass
+            for uid in receivers
+        ]
+        for fut in futures:
+            mappings.extend(fut.result())
     exec_many(
         "INSERT INTO message_map(bot_message_id, original_user_id, receiver_id, created_at) VALUES(%s, %s, %s, %s)",
         mappings,
@@ -285,16 +349,22 @@ def relay_album(messages: list) -> None:
     mappings: list[tuple] = []
     now = int(time.time())
     msg_ids = [m.message_id for m in messages]
-    for uid in active_receivers():
-        if uid == sender:
-            continue
-        for msg_id in msg_ids:
-            try:
-                sent = bot.copy_message(chat_id=uid, from_chat_id=sender, message_id=msg_id)
-                if store_mapping:
-                    mappings.append((sent.message_id, sender, uid, now))
-            except Exception:
-                pass
+    receivers = [uid for uid in active_receivers() if uid != sender]
+    workers = max(1, min(SEND_MAX_WORKERS, len(receivers) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(
+                _send_album_to_user,
+                uid,
+                sender,
+                msg_ids,
+                store_mapping,
+                now,
+            )
+            for uid in receivers
+        ]
+        for fut in futures:
+            mappings.extend(fut.result())
     exec_many(
         "INSERT INTO message_map(bot_message_id, original_user_id, receiver_id, created_at) VALUES(%s, %s, %s, %s)",
         mappings,
