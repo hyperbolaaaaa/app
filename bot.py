@@ -149,11 +149,46 @@ def set_setting(key: str, value: str) -> None:
     )
 
 
-def start_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("User Commands", callback_data="show_user_commands")]]
+def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("User Menu", callback_data="menu_user")]]
     if is_admin(user_id):
-        rows.insert(0, [InlineKeyboardButton("Show Admin Commands", callback_data="show_admin_commands")])
+        rows.insert(0, [InlineKeyboardButton("Admin Menu", callback_data="menu_admin")])
     return InlineKeyboardMarkup(rows)
+
+
+def user_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("/help", callback_data="user_help")],
+            [InlineKeyboardButton("/chatid", callback_data="user_chatid")],
+            [InlineKeyboardButton("Back", callback_data="menu_back")],
+        ]
+    )
+
+
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Stats", callback_data="admin_stats"),
+                InlineKeyboardButton("Dup Status", callback_data="admin_dupstatus"),
+            ],
+            [
+                InlineKeyboardButton("Open Join", callback_data="admin_openjoin"),
+                InlineKeyboardButton("Close Join", callback_data="admin_closejoin"),
+            ],
+            [
+                InlineKeyboardButton("Dup ON", callback_data="admin_dupon"),
+                InlineKeyboardButton("Dup OFF", callback_data="admin_dupoff"),
+            ],
+            [
+                InlineKeyboardButton("Words", callback_data="admin_words"),
+                InlineKeyboardButton("Clear Map", callback_data="admin_clearmap"),
+            ],
+            [InlineKeyboardButton("Show All Commands", callback_data="admin_show_commands")],
+            [InlineKeyboardButton("Back", callback_data="menu_back")],
+        ]
+    )
 
 
 def get_state(user_id: int) -> str:
@@ -272,7 +307,7 @@ def start_command(message):
         bot.send_message(
             uid,
             "Admin access granted.\nUse button below to see all admin commands.",
-            reply_markup=start_keyboard(uid),
+            reply_markup=main_menu_keyboard(uid),
         )
         return
     if not user_exists(uid):
@@ -281,19 +316,123 @@ def start_command(message):
             return
         exec_sql("INSERT INTO users(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (uid,))
     if not get_username(uid):
-        bot.send_message(uid, get_setting("welcome_message"), reply_markup=start_keyboard(uid))
+        bot.send_message(uid, get_setting("welcome_message"), reply_markup=main_menu_keyboard(uid))
     else:
-        bot.send_message(uid, "Welcome back.", reply_markup=start_keyboard(uid))
+        bot.send_message(uid, "Welcome back.", reply_markup=main_menu_keyboard(uid))
 
 
-@bot.callback_query_handler(func=lambda call: call.data in {"show_user_commands", "show_admin_commands"})
+@bot.callback_query_handler(
+    func=lambda call: call.data
+    in {
+        "menu_user",
+        "menu_admin",
+        "menu_back",
+        "user_help",
+        "user_chatid",
+        "admin_stats",
+        "admin_dupstatus",
+        "admin_openjoin",
+        "admin_closejoin",
+        "admin_dupon",
+        "admin_dupoff",
+        "admin_words",
+        "admin_clearmap",
+        "admin_show_commands",
+    }
+)
 def on_command_buttons(call):
     uid = call.message.chat.id
-    if call.data == "show_admin_commands":
+    if call.data == "menu_user":
+        bot.edit_message_text(
+            "User Menu",
+            chat_id=uid,
+            message_id=call.message.message_id,
+            reply_markup=user_menu_keyboard(),
+        )
+    elif call.data == "menu_admin":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
+            return
+        bot.edit_message_text(
+            "Admin Menu",
+            chat_id=uid,
+            message_id=call.message.message_id,
+            reply_markup=admin_menu_keyboard(),
+        )
+    elif call.data == "menu_back":
+        bot.edit_message_text(
+            "Main Menu",
+            chat_id=uid,
+            message_id=call.message.message_id,
+            reply_markup=main_menu_keyboard(uid),
+        )
+    elif call.data == "user_help":
+        bot.send_message(uid, USER_COMMANDS_TEXT)
+    elif call.data == "user_chatid":
+        bot.send_message(uid, f"Chat ID: {uid}")
+    elif call.data == "admin_show_commands":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
             return
         bot.send_message(uid, ADMIN_COMMANDS_TEXT)
+    elif call.data == "admin_stats":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
+            return
+        total = int((q1("SELECT COUNT(*) FROM users") or (0,))[0])
+        banned = int((q1("SELECT COUNT(*) FROM users WHERE banned=TRUE") or (0,))[0])
+        whitelisted = int((q1("SELECT COUNT(*) FROM users WHERE whitelisted=TRUE") or (0,))[0])
+        map_count = int((q1("SELECT COUNT(*) FROM message_map") or (0,))[0])
+        dup = int((q1("SELECT COALESCE(SUM(duplicate_count),0) FROM media_duplicates") or (0,))[0])
+        join_status = "OPEN" if get_setting("join_open", "true") == "true" else "CLOSED"
+        bot.send_message(
+            uid,
+            f"Users: {total}\nBanned: {banned}\nWhitelisted: {whitelisted}\nMap: {map_count}\nDuplicates: {dup}\nJoin: {join_status}",
+        )
+    elif call.data == "admin_dupstatus":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
+            return
+        bot.send_message(uid, f"Duplicate filter: {get_setting('duplicate_filter', 'false')}")
+    elif call.data == "admin_openjoin":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
+            return
+        set_setting("join_open", "true")
+        bot.send_message(uid, "Join opened.")
+    elif call.data == "admin_closejoin":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
+            return
+        set_setting("join_open", "false")
+        bot.send_message(uid, "Join closed.")
+    elif call.data == "admin_dupon":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
+            return
+        set_setting("duplicate_filter", "true")
+        bot.send_message(uid, "Duplicate filter enabled.")
+    elif call.data == "admin_dupoff":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
+            return
+        set_setting("duplicate_filter", "false")
+        bot.send_message(uid, "Duplicate filter disabled.")
+    elif call.data == "admin_words":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
+            return
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT word FROM banned_words ORDER BY word")
+                rows = [r[0] for r in c.fetchall()]
+        bot.send_message(uid, "\n".join(rows) if rows else "No banned words.")
+    elif call.data == "admin_clearmap":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
+            return
+        exec_sql("DELETE FROM message_map")
+        bot.send_message(uid, "Message map cleared.")
     else:
         bot.send_message(uid, USER_COMMANDS_TEXT)
     bot.answer_callback_query(call.id)
@@ -432,17 +571,14 @@ def relay(message):
 @bot.message_handler(commands=["adminmenu"])
 def adminmenu(message):
     if admin_guard(message):
-        bot.send_message(message.chat.id, ADMIN_COMMANDS_TEXT)
+        bot.send_message(message.chat.id, "Admin Menu", reply_markup=admin_menu_keyboard())
 
 
 @bot.message_handler(commands=["panel"])
 def panel(message):
     if not admin_guard(message):
         return
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Show Admin Commands", callback_data="show_admin_commands")]]
-    )
-    bot.send_message(message.chat.id, "Admin Panel", reply_markup=kb)
+    bot.send_message(message.chat.id, "Admin Menu", reply_markup=admin_menu_keyboard())
 
 
 def parse_target_id(message) -> Optional[int]:
