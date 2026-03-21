@@ -994,7 +994,7 @@ def _retry_after_seconds(error):
     return None
 
 
-def _copy_message_with_retry(user_id, sender_id, message_id):
+def _copy_message_with_retry(user_id, sender_id, message_id, caption=None):
     attempts = max(0, SEND_RETRIES) + 1
     for i in range(attempts):
         try:
@@ -1002,7 +1002,28 @@ def _copy_message_with_retry(user_id, sender_id, message_id):
                 chat_id=user_id,
                 from_chat_id=sender_id,
                 message_id=message_id,
+                caption=caption,
             )
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
+            return sent
+        except Exception as e:
+            wait = _retry_after_seconds(e)
+            if i < attempts - 1:
+                if wait is not None:
+                    time.sleep(max(0.05, wait))
+                else:
+                    time.sleep(0.15 * (i + 1))
+                continue
+            return None
+    return None
+
+
+def _send_text_with_retry(user_id, text):
+    attempts = max(0, SEND_RETRIES) + 1
+    for i in range(attempts):
+        try:
+            sent = bot.send_message(user_id, text)
             if FORWARD_DELAY > 0:
                 time.sleep(FORWARD_DELAY)
             return sent
@@ -1048,12 +1069,20 @@ def _process_single(message):
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
     mappings = []
     now = int(time.time())
+    prefix = build_prefix(sender_id)
     if not receivers:
         return
+
+    if message.content_type == "text":
+        text_to_send = prefix + (message.text or "")
+        send_fn = lambda uid: _send_text_with_retry(uid, text_to_send)
+    else:
+        send_fn = lambda uid: _copy_message_with_retry(uid, sender_id, message.message_id, caption=prefix)
+
     workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_uid = {
-            executor.submit(_copy_message_with_retry, user_id, sender_id, message.message_id): user_id
+            executor.submit(send_fn, user_id): user_id
             for user_id in receivers
         }
         for future in as_completed(future_to_uid):
@@ -1079,12 +1108,13 @@ def _process_album(messages):
     now = int(time.time())
     if not receivers:
         return
-    message_ids = [msg.message_id for msg in messages]
+    prefix = build_prefix(sender_id)
 
     def send_album_to_user(user_id):
         rows = []
-        for msg_id in message_ids:
-            sent = _copy_message_with_retry(user_id, sender_id, msg_id)
+        for index, msg in enumerate(messages):
+            cap = prefix if index == 0 else None
+            sent = _copy_message_with_retry(user_id, sender_id, msg.message_id, caption=cap)
             if sent:
                 rows.append((sent.message_id, sender_id, user_id, now))
         return rows
