@@ -26,6 +26,7 @@ FIRST_ADMIN_ID = os.getenv("ADMIN_ID") # replace with your Telegram ID for initi
 
 REQUIRED_MEDIA = 12
 INACTIVITY_LIMIT = 6 * 60 * 60  # 6 hours
+FORWARD_DELAY = float(os.getenv("FORWARD_DELAY", "0.01"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -918,6 +919,21 @@ def save_mapping(bot_msg_id, original_user_id, receiver_id):
                 receiver_id,
                 int(time.time())
             ))
+
+
+def save_mappings(rows):
+    if not rows:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.executemany(
+                """
+                INSERT INTO message_map
+                (bot_message_id, original_user_id, receiver_id, created_at)
+                VALUES (%s, %s, %s, %s)
+                """,
+                rows,
+            )
 # =========================
 # 🚀 BROADCAST WORKER
 # =========================
@@ -948,6 +964,8 @@ def _process_single(message):
 
     sender_id = message.chat.id
     receivers = get_active_receivers()
+    mappings = []
+    now = int(time.time())
     for user_id in receivers:
 
         if user_id == sender_id:
@@ -983,18 +1001,13 @@ def _process_single(message):
                     # +(message.caption or "")
                 )
 
-
-            save_mapping(
-                sent.message_id,
-                sender_id,
-                user_id
-            )
-
-            delay = max(0.03, len(receivers) / 1000) # rate control
-            time.sleep(delay)
+            mappings.append((sent.message_id, sender_id, user_id, now))
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
             
         except Exception as e:
             print("Single send error:", e)
+    save_mappings(mappings)
 
    
 # =========================
@@ -1005,6 +1018,8 @@ def _process_album(messages):
 
     sender_id = messages[0].chat.id
     receivers = get_active_receivers()
+    mappings = []
+    now = int(time.time())
 
     media_objects = []
 
@@ -1047,12 +1062,13 @@ def _process_album(messages):
                 sent_msgs = bot.send_media_group(user_id, chunk)
 
                 for sent in sent_msgs:
-                    save_mapping(sent.message_id, sender_id, user_id)
-                delay = min(0.05, 1 / max(1, len(receivers) / 25))
-                time.sleep(delay)
+                    mappings.append((sent.message_id, sender_id, user_id, now))
+                if FORWARD_DELAY > 0:
+                    time.sleep(FORWARD_DELAY)
 
             except Exception as e:
                 print("Album send error:", e)
+    save_mappings(mappings)
     # external_forward.forward_album(bot, messages)
 
 # =========================
