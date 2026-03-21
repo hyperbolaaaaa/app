@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import psycopg2
 from psycopg2 import pool as pg_pool
 import telebot
+from telebot.types import InputMediaPhoto, InputMediaVideo
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
@@ -179,6 +180,11 @@ def init_db():
             c.execute("""
                 INSERT INTO settings(key, value)
                 VALUES('duplicate_filter', 'false')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('maintenance_mode', 'false')
                 ON CONFLICT DO NOTHING
             """)
             # =========================
@@ -441,6 +447,27 @@ def set_join_status(status: bool):
                 SET value=%s
                 WHERE key='join_open'
             """, ("true" if status else "false",))
+
+
+def is_maintenance_mode():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='maintenance_mode'")
+            row = c.fetchone()
+            return row and row[0] == "true"
+
+
+def set_maintenance_mode(status: bool):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('maintenance_mode', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                ("true" if status else "false",),
+            )
 # =========================
 # 🧠 USER STATE RESOLVER
 # =========================
@@ -651,6 +678,10 @@ def check_and_register_duplicate(file_id, sender_id):
 def start_command(message):
 
     user_id = message.chat.id
+
+    if is_maintenance_mode() and not is_admin(user_id):
+        bot.send_message(user_id, "Bot is under maintenance. Try again later.")
+        return
 
     # 🚫 Manual Ban
     if is_banned(user_id):
@@ -994,7 +1025,7 @@ def _retry_after_seconds(error):
     return None
 
 
-def _copy_message_with_retry(user_id, sender_id, message_id, caption=None):
+def _copy_message_with_retry(user_id, sender_id, message_id):
     attempts = max(0, SEND_RETRIES) + 1
     for i in range(attempts):
         try:
@@ -1002,28 +1033,7 @@ def _copy_message_with_retry(user_id, sender_id, message_id, caption=None):
                 chat_id=user_id,
                 from_chat_id=sender_id,
                 message_id=message_id,
-                caption=caption,
             )
-            if FORWARD_DELAY > 0:
-                time.sleep(FORWARD_DELAY)
-            return sent
-        except Exception as e:
-            wait = _retry_after_seconds(e)
-            if i < attempts - 1:
-                if wait is not None:
-                    time.sleep(max(0.05, wait))
-                else:
-                    time.sleep(0.15 * (i + 1))
-                continue
-            return None
-    return None
-
-
-def _send_text_with_retry(user_id, text):
-    attempts = max(0, SEND_RETRIES) + 1
-    for i in range(attempts):
-        try:
-            sent = bot.send_message(user_id, text)
             if FORWARD_DELAY > 0:
                 time.sleep(FORWARD_DELAY)
             return sent
@@ -1069,20 +1079,12 @@ def _process_single(message):
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
     mappings = []
     now = int(time.time())
-    prefix = build_prefix(sender_id)
     if not receivers:
         return
-
-    if message.content_type == "text":
-        text_to_send = prefix + (message.text or "")
-        send_fn = lambda uid: _send_text_with_retry(uid, text_to_send)
-    else:
-        send_fn = lambda uid: _copy_message_with_retry(uid, sender_id, message.message_id, caption=prefix)
-
     workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_uid = {
-            executor.submit(send_fn, user_id): user_id
+            executor.submit(_copy_message_with_retry, user_id, sender_id, message.message_id): user_id
             for user_id in receivers
         }
         for future in as_completed(future_to_uid):
@@ -1109,14 +1111,32 @@ def _process_album(messages):
     if not receivers:
         return
     prefix = build_prefix(sender_id)
+    media_objects = []
+    for index, msg in enumerate(messages):
+        if msg.content_type == "photo":
+            media_objects.append(
+                InputMediaPhoto(
+                    media=msg.photo[-1].file_id,
+                    caption=(prefix if index == 0 else None),
+                )
+            )
+        elif msg.content_type == "video":
+            media_objects.append(
+                InputMediaVideo(
+                    media=msg.video.file_id,
+                    caption=(prefix if index == 0 else None),
+                )
+            )
+    chunks = [media_objects[i:i+10] for i in range(0, len(media_objects), 10)]
 
     def send_album_to_user(user_id):
         rows = []
-        for index, msg in enumerate(messages):
-            cap = prefix if index == 0 else None
-            sent = _copy_message_with_retry(user_id, sender_id, msg.message_id, caption=cap)
-            if sent:
+        for chunk in chunks:
+            sent_msgs = bot.send_media_group(user_id, chunk)
+            for sent in sent_msgs:
                 rows.append((sent.message_id, sender_id, user_id, now))
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
         return rows
 
     workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
@@ -1139,6 +1159,10 @@ def _process_album(messages):
     content_types=['text', 'photo', 'video']
 )
 def relay(message):
+
+    if is_maintenance_mode() and not is_admin(message.chat.id):
+        bot.send_message(message.chat.id, "Bot is under maintenance. Try again later.")
+        return
 
     if handle_restrictions(message):
         return
@@ -1727,6 +1751,22 @@ def unwhitelist_command(message):
         message.chat.id,
         f"❌ User {target_id} removed from whitelist."
     )
+@bot.message_handler(commands=['closebot'])
+def closebot_command(message):
+    if not is_admin(message.chat.id):
+        return
+    set_maintenance_mode(True)
+    bot.send_message(message.chat.id, "Maintenance mode enabled. Bot is closed for users.")
+
+
+@bot.message_handler(commands=['openbot'])
+def openbot_command(message):
+    if not is_admin(message.chat.id):
+        return
+    set_maintenance_mode(False)
+    bot.send_message(message.chat.id, "Maintenance mode disabled. Bot is open now.")
+
+
 @bot.message_handler(commands=['adminmenu'])
 def admin_menu(message):
 
