@@ -8,8 +8,10 @@ import threading
 import queue
 from contextlib import contextmanager
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
  # make sure to have this file for cross-instance forwarding
 import psycopg2
+from psycopg2 import pool as pg_pool
 import telebot
 from telebot.types import InputMediaPhoto, InputMediaVideo
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -27,6 +29,12 @@ FIRST_ADMIN_ID = os.getenv("ADMIN_ID") # replace with your Telegram ID for initi
 REQUIRED_MEDIA = 12
 INACTIVITY_LIMIT = 6 * 60 * 60  # 6 hours
 FORWARD_DELAY = float(os.getenv("FORWARD_DELAY", "0.01"))
+SEND_MAX_WORKERS = int(os.getenv("SEND_MAX_WORKERS", "8"))
+SEND_RETRIES = int(os.getenv("SEND_RETRIES", "2"))
+RECEIVER_CACHE_TTL = int(os.getenv("RECEIVER_CACHE_TTL", "10"))
+BROADCAST_QUEUE_SIZE = int(os.getenv("BROADCAST_QUEUE_SIZE", "2000"))
+DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
+DB_POOL_MAX_CONN = int(os.getenv("DB_POOL_MAX_CONN", "15"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -34,7 +42,7 @@ if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
 
 bot = telebot.TeleBot(BOT_TOKEN)
-broadcast_queue = queue.Queue()
+broadcast_queue = queue.Queue(maxsize=BROADCAST_QUEUE_SIZE)
 media_groups = defaultdict(list)
 album_timers = {}
 user_media_buffer = defaultdict(list)
@@ -43,14 +51,33 @@ media_buffer_lock = threading.Lock()
 activation_buffer = defaultdict(int)
 activation_timer = {}
 activation_lock = threading.Lock()
+db_pool = None
+receiver_cache_lock = threading.Lock()
+receiver_cache = []
+receiver_cache_at = 0.0
 
 # =========================
 # 🗄 DATABASE CONNECTION
 # =========================
 
+def init_db_pool():
+    global db_pool
+    if db_pool is None:
+        db_pool = pg_pool.SimpleConnectionPool(
+            DB_POOL_MIN_CONN,
+            DB_POOL_MAX_CONN,
+            dsn=DATABASE_URL,
+        )
+
+
 @contextmanager
 def get_connection():
-    conn = psycopg2.connect(DATABASE_URL)
+    if db_pool is not None:
+        conn = db_pool.getconn()
+        use_pool = True
+    else:
+        conn = psycopg2.connect(DATABASE_URL)
+        use_pool = False
     try:
         yield conn
         conn.commit()
@@ -58,7 +85,10 @@ def get_connection():
         conn.rollback()
         raise
     finally:
-        conn.close()
+        if use_pool:
+            db_pool.putconn(conn)
+        else:
+            conn.close()
 # =========================
 # 🧱 DATABASE INITIALIZATION
 # =========================
@@ -150,6 +180,11 @@ def init_db():
             c.execute("""
                 INSERT INTO settings(key, value)
                 VALUES('duplicate_filter', 'false')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('maintenance_mode', 'false')
                 ON CONFLICT DO NOTHING
             """)
             # =========================
@@ -412,6 +447,27 @@ def set_join_status(status: bool):
                 SET value=%s
                 WHERE key='join_open'
             """, ("true" if status else "false",))
+
+
+def is_maintenance_mode():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='maintenance_mode'")
+            row = c.fetchone()
+            return row and row[0] == "true"
+
+
+def set_maintenance_mode(status: bool):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('maintenance_mode', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                ("true" if status else "false",),
+            )
 # =========================
 # 🧠 USER STATE RESOLVER
 # =========================
@@ -435,7 +491,7 @@ def get_user_state(user_id):
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
-                SELECT auto_banned, last_activation_time
+                SELECT last_activation_time
                 FROM users
                 WHERE user_id=%s
             """, (user_id,))
@@ -444,13 +500,13 @@ def get_user_state(user_id):
     if not row:
         return "JOINING"
 
-    auto_banned, last_activation_time = row
-
-    if auto_banned:
-        return "INACTIVE"
+    last_activation_time = row[0]
 
     if last_activation_time is None:
         return "JOINING"
+
+    if last_activation_time < int(time.time()) - INACTIVITY_LIMIT:
+        return "INACTIVE"
 
     return "ACTIVE"
 # =========================
@@ -622,6 +678,10 @@ def check_and_register_duplicate(file_id, sender_id):
 def start_command(message):
 
     user_id = message.chat.id
+
+    if is_maintenance_mode() and not is_admin(user_id):
+        bot.send_message(user_id, "Bot is under maintenance. Try again later.")
+        return
 
     # 🚫 Manual Ban
     if is_banned(user_id):
@@ -882,6 +942,7 @@ def handle_restrictions(message):
 
 def get_active_receivers():
 
+    active_cutoff = int(time.time()) - INACTIVITY_LIMIT
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
@@ -894,12 +955,22 @@ def get_active_receivers():
                         a.user_id IS NOT NULL
                         OR u.whitelisted = TRUE
                         OR (
-                            u.auto_banned = FALSE
-                            AND u.last_activation_time IS NOT NULL
+                            u.last_activation_time IS NOT NULL
+                            AND u.last_activation_time >= %s
                         )
                       )
-            """)
+            """, (active_cutoff,))
             return [row[0] for row in c.fetchall()]
+
+
+def get_receivers_cached(force=False):
+    global receiver_cache, receiver_cache_at
+    now = time.time()
+    with receiver_cache_lock:
+        if force or (now - receiver_cache_at) >= RECEIVER_CACHE_TTL:
+            receiver_cache = get_active_receivers()
+            receiver_cache_at = now
+        return list(receiver_cache)
 
 # =========================
 # 📝 SAVE MESSAGE MAP
@@ -934,6 +1005,69 @@ def save_mappings(rows):
                 """,
                 rows,
             )
+
+
+def _retry_after_seconds(error):
+    retry_after = getattr(error, "retry_after", None)
+    if retry_after is not None:
+        try:
+            return float(retry_after)
+        except Exception:
+            return None
+    result_json = getattr(error, "result_json", None)
+    if isinstance(result_json, dict):
+        params = result_json.get("parameters", {})
+        retry_after = params.get("retry_after")
+        if retry_after is not None:
+            try:
+                return float(retry_after)
+            except Exception:
+                return None
+    return None
+
+
+def _copy_message_with_retry(user_id, sender_id, message_id):
+    attempts = max(0, SEND_RETRIES) + 1
+    for i in range(attempts):
+        try:
+            sent = bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=sender_id,
+                message_id=message_id,
+            )
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
+            return sent
+        except Exception as e:
+            wait = _retry_after_seconds(e)
+            if i < attempts - 1:
+                if wait is not None:
+                    time.sleep(max(0.05, wait))
+                else:
+                    time.sleep(0.15 * (i + 1))
+                continue
+            return None
+    return None
+
+
+def _send_text_with_retry(user_id, text):
+    attempts = max(0, SEND_RETRIES) + 1
+    for i in range(attempts):
+        try:
+            sent = bot.send_message(user_id, text)
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
+            return sent
+        except Exception as e:
+            wait = _retry_after_seconds(e)
+            if i < attempts - 1:
+                if wait is not None:
+                    time.sleep(max(0.05, wait))
+                else:
+                    time.sleep(0.15 * (i + 1))
+                continue
+            return None
+    return None
 # =========================
 # 🚀 BROADCAST WORKER
 # =========================
@@ -963,50 +1097,31 @@ def broadcast_worker():
 def _process_single(message):
 
     sender_id = message.chat.id
-    receivers = get_active_receivers()
+    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
     mappings = []
     now = int(time.time())
-    for user_id in receivers:
-
-        if user_id == sender_id:
-            continue
-
-        try:
-            # sent = bot.copy_message(
-            #     chat_id=user_id,
-            #     from_chat_id=sender_id,
-            #     message_id=message.message_id
-            # )
-            prefix = build_prefix(sender_id)
-
-            if message.content_type == "text":
-                sent = bot.send_message(
-                    user_id,
-                    prefix + message.text
-                )
-
-            elif message.content_type == "photo":
-                sent = bot.send_photo(
-                    user_id,
-                    message.photo[-1].file_id,
-                    caption=prefix 
-                    # + (message.caption or "")
-                )
-
-            elif message.content_type == "video":
-                sent = bot.send_video(
-                    user_id,
-                    message.video.file_id,
-                    caption=prefix 
-                    # +(message.caption or "")
-                )
-
-            mappings.append((sent.message_id, sender_id, user_id, now))
-            if FORWARD_DELAY > 0:
-                time.sleep(FORWARD_DELAY)
-            
-        except Exception as e:
-            print("Single send error:", e)
+    prefix = build_prefix(sender_id)
+    if not receivers:
+        return
+    if message.content_type == "text":
+        text_to_send = prefix + (message.text or "")
+        send_fn = lambda uid: _send_text_with_retry(uid, text_to_send)
+    else:
+        send_fn = lambda uid: _copy_message_with_retry(uid, sender_id, message.message_id)
+    workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_uid = {
+            executor.submit(send_fn, user_id): user_id
+            for user_id in receivers
+        }
+        for future in as_completed(future_to_uid):
+            user_id = future_to_uid[future]
+            try:
+                sent = future.result()
+                if sent:
+                    mappings.append((sent.message_id, sender_id, user_id, now))
+            except Exception as e:
+                print("Single send error:", e)
     save_mappings(mappings)
 
    
@@ -1017,55 +1132,46 @@ def _process_single(message):
 def _process_album(messages):
 
     sender_id = messages[0].chat.id
-    receivers = get_active_receivers()
+    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
     mappings = []
     now = int(time.time())
-
+    if not receivers:
+        return
+    prefix = build_prefix(sender_id)
     media_objects = []
-
     for index, msg in enumerate(messages):
         if msg.content_type == "photo":
             media_objects.append(
                 InputMediaPhoto(
                     media=msg.photo[-1].file_id,
-                    caption=(
-                        build_prefix(sender_id)
-                        if index == 0 else None
-                    )
+                    caption=(prefix if index == 0 else None),
                 )
             )
-
         elif msg.content_type == "video":
             media_objects.append(
                 InputMediaVideo(
                     media=msg.video.file_id,
-                    caption=(
-                        build_prefix(sender_id)
-                        if index == 0 else None
-                    )
+                    caption=(prefix if index == 0 else None),
                 )
             )
+    chunks = [media_objects[i:i+10] for i in range(0, len(media_objects), 10)]
 
-    # Telegram max 10 per album
-    chunks = [
-        media_objects[i:i+10]
-        for i in range(0, len(media_objects), 10)
-    ]
-
-    for user_id in receivers:
-
-        if user_id == sender_id:
-            continue
-
+    def send_album_to_user(user_id):
+        rows = []
         for chunk in chunks:
+            sent_msgs = bot.send_media_group(user_id, chunk)
+            for sent in sent_msgs:
+                rows.append((sent.message_id, sender_id, user_id, now))
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
+        return rows
+
+    workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(send_album_to_user, user_id) for user_id in receivers]
+        for future in as_completed(futures):
             try:
-                sent_msgs = bot.send_media_group(user_id, chunk)
-
-                for sent in sent_msgs:
-                    mappings.append((sent.message_id, sender_id, user_id, now))
-                if FORWARD_DELAY > 0:
-                    time.sleep(FORWARD_DELAY)
-
+                mappings.extend(future.result())
             except Exception as e:
                 print("Album send error:", e)
     save_mappings(mappings)
@@ -1080,6 +1186,10 @@ def _process_album(messages):
     content_types=['text', 'photo', 'video']
 )
 def relay(message):
+
+    if is_maintenance_mode() and not is_admin(message.chat.id):
+        bot.send_message(message.chat.id, "Bot is under maintenance. Try again later.")
+        return
 
     if handle_restrictions(message):
         return
@@ -1378,6 +1488,7 @@ def stats_command(message):
     if not is_admin(message.chat.id):
         return
 
+    active_cutoff = int(time.time()) - INACTIVITY_LIMIT
     with get_connection() as conn:
         with conn.cursor() as c:
 
@@ -1385,14 +1496,31 @@ def stats_command(message):
             total = c.fetchone()[0]
 
             c.execute("""
-                SELECT COUNT(*) FROM users
-                WHERE banned=FALSE
-                  AND auto_banned=FALSE
-                  AND last_activation_time IS NOT NULL
-            """)
+                SELECT COUNT(*) FROM users u
+                LEFT JOIN admins a ON u.user_id = a.user_id
+                WHERE u.banned=FALSE
+                  AND u.username IS NOT NULL
+                  AND (
+                        a.user_id IS NOT NULL
+                        OR u.whitelisted=TRUE
+                        OR (
+                            u.last_activation_time IS NOT NULL
+                            AND u.last_activation_time >= %s
+                        )
+                      )
+            """, (active_cutoff,))
             active = c.fetchone()[0]
 
-            c.execute("SELECT COUNT(*) FROM users WHERE auto_banned=TRUE")
+            c.execute("""
+                SELECT COUNT(*) FROM users u
+                LEFT JOIN admins a ON u.user_id = a.user_id
+                WHERE u.banned=FALSE
+                  AND u.username IS NOT NULL
+                  AND a.user_id IS NULL
+                  AND u.whitelisted=FALSE
+                  AND u.last_activation_time IS NOT NULL
+                  AND u.last_activation_time < %s
+            """, (active_cutoff,))
             inactive = c.fetchone()[0]
 
             c.execute("SELECT COUNT(*) FROM users WHERE banned=TRUE")
@@ -1668,6 +1796,22 @@ def unwhitelist_command(message):
         message.chat.id,
         f"❌ User {target_id} removed from whitelist."
     )
+@bot.message_handler(commands=['closebot'])
+def closebot_command(message):
+    if not is_admin(message.chat.id):
+        return
+    set_maintenance_mode(True)
+    bot.send_message(message.chat.id, "Maintenance mode enabled. Bot is closed for users.")
+
+
+@bot.message_handler(commands=['openbot'])
+def openbot_command(message):
+    if not is_admin(message.chat.id):
+        return
+    set_maintenance_mode(False)
+    bot.send_message(message.chat.id, "Maintenance mode disabled. Bot is open now.")
+
+
 @bot.message_handler(commands=['adminmenu'])
 def admin_menu(message):
 
@@ -1776,12 +1920,15 @@ def get_channel_id(message):
 
 if __name__ == "__main__":
 
-    print("🤖 Starting bot...")
+    print("Starting bot...")
 
+    init_db_pool()
     init_db()
-    print("✅ Database ready.")
+    print("Database ready.")
 
     start_background_workers()
-    print("✅ Background workers running.")
+    print("Background workers running.")
 
     bot.infinity_polling(skip_pending=True)
+
+
