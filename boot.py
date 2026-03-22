@@ -491,7 +491,7 @@ def get_user_state(user_id):
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
-                SELECT auto_banned, last_activation_time
+                SELECT last_activation_time
                 FROM users
                 WHERE user_id=%s
             """, (user_id,))
@@ -500,13 +500,13 @@ def get_user_state(user_id):
     if not row:
         return "JOINING"
 
-    auto_banned, last_activation_time = row
-
-    if auto_banned:
-        return "INACTIVE"
+    last_activation_time = row[0]
 
     if last_activation_time is None:
         return "JOINING"
+
+    if last_activation_time < int(time.time()) - INACTIVITY_LIMIT:
+        return "INACTIVE"
 
     return "ACTIVE"
 # =========================
@@ -942,6 +942,7 @@ def handle_restrictions(message):
 
 def get_active_receivers():
 
+    active_cutoff = int(time.time()) - INACTIVITY_LIMIT
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
@@ -954,11 +955,11 @@ def get_active_receivers():
                         a.user_id IS NOT NULL
                         OR u.whitelisted = TRUE
                         OR (
-                            u.auto_banned = FALSE
-                            AND u.last_activation_time IS NOT NULL
+                            u.last_activation_time IS NOT NULL
+                            AND u.last_activation_time >= %s
                         )
                       )
-            """)
+            """, (active_cutoff,))
             return [row[0] for row in c.fetchall()]
 
 
@@ -1047,6 +1048,26 @@ def _copy_message_with_retry(user_id, sender_id, message_id):
                 continue
             return None
     return None
+
+
+def _send_text_with_retry(user_id, text):
+    attempts = max(0, SEND_RETRIES) + 1
+    for i in range(attempts):
+        try:
+            sent = bot.send_message(user_id, text)
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
+            return sent
+        except Exception as e:
+            wait = _retry_after_seconds(e)
+            if i < attempts - 1:
+                if wait is not None:
+                    time.sleep(max(0.05, wait))
+                else:
+                    time.sleep(0.15 * (i + 1))
+                continue
+            return None
+    return None
 # =========================
 # 🚀 BROADCAST WORKER
 # =========================
@@ -1079,12 +1100,18 @@ def _process_single(message):
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
     mappings = []
     now = int(time.time())
+    prefix = build_prefix(sender_id)
     if not receivers:
         return
+    if message.content_type == "text":
+        text_to_send = prefix + (message.text or "")
+        send_fn = lambda uid: _send_text_with_retry(uid, text_to_send)
+    else:
+        send_fn = lambda uid: _copy_message_with_retry(uid, sender_id, message.message_id)
     workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_uid = {
-            executor.submit(_copy_message_with_retry, user_id, sender_id, message.message_id): user_id
+            executor.submit(send_fn, user_id): user_id
             for user_id in receivers
         }
         for future in as_completed(future_to_uid):
@@ -1461,6 +1488,7 @@ def stats_command(message):
     if not is_admin(message.chat.id):
         return
 
+    active_cutoff = int(time.time()) - INACTIVITY_LIMIT
     with get_connection() as conn:
         with conn.cursor() as c:
 
@@ -1468,14 +1496,31 @@ def stats_command(message):
             total = c.fetchone()[0]
 
             c.execute("""
-                SELECT COUNT(*) FROM users
-                WHERE banned=FALSE
-                  AND auto_banned=FALSE
-                  AND last_activation_time IS NOT NULL
-            """)
+                SELECT COUNT(*) FROM users u
+                LEFT JOIN admins a ON u.user_id = a.user_id
+                WHERE u.banned=FALSE
+                  AND u.username IS NOT NULL
+                  AND (
+                        a.user_id IS NOT NULL
+                        OR u.whitelisted=TRUE
+                        OR (
+                            u.last_activation_time IS NOT NULL
+                            AND u.last_activation_time >= %s
+                        )
+                      )
+            """, (active_cutoff,))
             active = c.fetchone()[0]
 
-            c.execute("SELECT COUNT(*) FROM users WHERE auto_banned=TRUE")
+            c.execute("""
+                SELECT COUNT(*) FROM users u
+                LEFT JOIN admins a ON u.user_id = a.user_id
+                WHERE u.banned=FALSE
+                  AND u.username IS NOT NULL
+                  AND a.user_id IS NULL
+                  AND u.whitelisted=FALSE
+                  AND u.last_activation_time IS NOT NULL
+                  AND u.last_activation_time < %s
+            """, (active_cutoff,))
             inactive = c.fetchone()[0]
 
             c.execute("SELECT COUNT(*) FROM users WHERE banned=TRUE")
