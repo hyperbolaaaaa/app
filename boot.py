@@ -33,15 +33,14 @@ INACTIVITY_LIMIT = 6 * 60 * 60  # 6 hours
 FORWARD_DELAY = float(os.getenv("FORWARD_DELAY", "0.01"))
 SEND_MAX_WORKERS = int(os.getenv("SEND_MAX_WORKERS", "8"))
 SEND_RETRIES = int(os.getenv("SEND_RETRIES", "2"))
-RECEIVER_CACHE_TTL = int(os.getenv("RECEIVER_CACHE_TTL", "120"))
+RECEIVER_CACHE_TTL = int(os.getenv("RECEIVER_CACHE_TTL", "10"))
 BROADCAST_QUEUE_SIZE = int(os.getenv("BROADCAST_QUEUE_SIZE", "2000"))
 DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
 DB_POOL_MAX_CONN = int(os.getenv("DB_POOL_MAX_CONN", "15"))
-MESSAGE_MAP_MODE = os.getenv("MESSAGE_MAP_MODE", "admin_only").strip().lower()
+MESSAGE_MAP_MODE = os.getenv("MESSAGE_MAP_MODE", "full").strip().lower()
 MAP_RETENTION_DAYS = int(os.getenv("MAP_RETENTION_DAYS", "2"))
 MAP_CLEANUP_INTERVAL_SECONDS = int(os.getenv("MAP_CLEANUP_INTERVAL_SECONDS", "300"))
 MAP_INSERT_BATCH_SIZE = int(os.getenv("MAP_INSERT_BATCH_SIZE", "100"))
-SPAM_INTERVAL_SECONDS = float(os.getenv("SPAM_INTERVAL_SECONDS", "0.5"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -63,15 +62,6 @@ receiver_cache_lock = threading.Lock()
 receiver_cache = []
 receiver_cache_at = 0.0
 pending_recovery_import = set()
-user_cache = {}
-user_cache_lock = threading.Lock()
-admin_cache = set()
-admin_cache_lock = threading.Lock()
-banned_words_cache = set()
-banned_words_cache_lock = threading.Lock()
-last_message_time = {}
-last_message_lock = threading.Lock()
-send_executor = ThreadPoolExecutor(max_workers=SEND_MAX_WORKERS)
 
 # =========================
 # 🗄 DATABASE CONNECTION
@@ -106,109 +96,6 @@ def get_connection():
             db_pool.putconn(conn)
         else:
             conn.close()
-
-
-def invalidate_receivers_cache():
-    global receiver_cache_at
-    with receiver_cache_lock:
-        receiver_cache_at = 0.0
-
-
-def load_user_into_cache(user_id):
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute(
-                """
-                SELECT username, banned, whitelisted, last_activation_time
-                FROM users
-                WHERE user_id=%s
-                """,
-                (user_id,),
-            )
-            row = c.fetchone()
-
-    with user_cache_lock:
-        if row:
-            user_cache[user_id] = {
-                "username": row[0],
-                "banned": bool(row[1]),
-                "whitelisted": bool(row[2]),
-                "last_activation_time": row[3],
-            }
-        else:
-            user_cache.pop(user_id, None)
-
-
-def get_user_cached(user_id):
-    with user_cache_lock:
-        cached = user_cache.get(user_id)
-    if cached is not None:
-        return cached
-    load_user_into_cache(user_id)
-    with user_cache_lock:
-        return user_cache.get(user_id)
-
-
-def update_user_cache(user_id, **fields):
-    with user_cache_lock:
-        cached = user_cache.get(user_id)
-        if cached is None:
-            return
-        cached.update(fields)
-
-
-def load_banned_words():
-    global banned_words_cache
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("SELECT word FROM banned_words")
-            rows = c.fetchall()
-    with banned_words_cache_lock:
-        banned_words_cache = {r[0] for r in rows}
-
-
-def load_admin_cache():
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("SELECT user_id FROM admins")
-            rows = c.fetchall()
-    with admin_cache_lock:
-        admin_cache.clear()
-        admin_cache.update(r[0] for r in rows)
-
-
-def load_all_users_cache():
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute(
-                """
-                SELECT user_id, username, banned, whitelisted, last_activation_time
-                FROM users
-                """
-            )
-            rows = c.fetchall()
-    rebuilt = {
-        r[0]: {
-            "username": r[1],
-            "banned": bool(r[2]),
-            "whitelisted": bool(r[3]),
-            "last_activation_time": r[4],
-        }
-        for r in rows
-    }
-    with user_cache_lock:
-        user_cache.clear()
-        user_cache.update(rebuilt)
-
-
-def is_spam(user_id):
-    now = time.time()
-    with last_message_lock:
-        last = last_message_time.get(user_id, 0.0)
-        if now - last < SPAM_INTERVAL_SECONDS:
-            return True
-        last_message_time[user_id] = now
-    return False
 # =========================
 # 🧱 DATABASE INITIALIZATION
 # =========================
@@ -419,28 +306,29 @@ def add_user(user_id):
                 VALUES(%s)
                 ON CONFLICT DO NOTHING
             """, (user_id,))
-    load_user_into_cache(user_id)
-    invalidate_receivers_cache()
 # =========================
 # 🏷 USERNAME HELPERS
 # =========================
 
 def get_username(user_id):
-    user = get_user_cached(user_id)
-    return user["username"] if user else None
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT username FROM users WHERE user_id=%s",
+                (user_id,)
+            )
+            row = c.fetchone()
+            return row[0] if row else None
 
 
 def set_username(user_id, username):
-    clean_username = username.lower()
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
                 UPDATE users
                 SET username=%s
                 WHERE user_id=%s
-            """, (clean_username, user_id))
-    update_user_cache(user_id, username=clean_username)
-    invalidate_receivers_cache()
+            """, (username.lower(), user_id))
 
 
 def username_taken(username):
@@ -527,17 +415,20 @@ def import_recovery_payload(payload):
                 WHERE u.username = r.username
                 """
             )
-    load_banned_words()
-    load_all_users_cache()
-    invalidate_receivers_cache()
+
     return imported_users, imported_words
 # =========================
 # 👑 ADMIN HELPERS
 # =========================
 
 def is_admin(user_id):
-    with admin_cache_lock:
-        return user_id in admin_cache
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT 1 FROM admins WHERE user_id=%s",
+                (user_id,)
+            )
+            return c.fetchone() is not None
 
 
 def should_store_mapping(sender_id):
@@ -556,9 +447,6 @@ def add_admin(user_id):
                 VALUES(%s)
                 ON CONFLICT DO NOTHING
             """, (user_id,))
-    with admin_cache_lock:
-        admin_cache.add(user_id)
-    invalidate_receivers_cache()
 
 
 def remove_admin(user_id):
@@ -568,9 +456,6 @@ def remove_admin(user_id):
                 "DELETE FROM admins WHERE user_id=%s",
                 (user_id,)
             )
-    with admin_cache_lock:
-        admin_cache.discard(user_id)
-    invalidate_receivers_cache()
 def build_prefix(user_id):
 
     username = get_username(user_id)
@@ -585,8 +470,14 @@ def build_prefix(user_id):
 # =========================
 
 def is_banned(user_id):
-    user = get_user_cached(user_id)
-    return bool(user and user["banned"])
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT banned FROM users WHERE user_id=%s",
+                (user_id,)
+            )
+            row = c.fetchone()
+            return row and row[0]
 
 
 def ban_user(user_id):
@@ -596,8 +487,6 @@ def ban_user(user_id):
                 "UPDATE users SET banned=TRUE WHERE user_id=%s",
                 (user_id,)
             )
-    update_user_cache(user_id, banned=True)
-    invalidate_receivers_cache()
 
 
 def unban_user(user_id):
@@ -607,15 +496,19 @@ def unban_user(user_id):
                 "UPDATE users SET banned=FALSE WHERE user_id=%s",
                 (user_id,)
             )
-    update_user_cache(user_id, banned=False)
-    invalidate_receivers_cache()
 # =========================
 # ⭐ WHITELIST HELPERS
 # =========================
 
 def is_whitelisted(user_id):
-    user = get_user_cached(user_id)
-    return bool(user and user["whitelisted"])
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT whitelisted FROM users WHERE user_id=%s",
+                (user_id,)
+            )
+            row = c.fetchone()
+            return row and row[0]
 
 
 def whitelist_user(user_id):
@@ -625,8 +518,6 @@ def whitelist_user(user_id):
                 "UPDATE users SET whitelisted=TRUE WHERE user_id=%s",
                 (user_id,)
             )
-    update_user_cache(user_id, whitelisted=True)
-    invalidate_receivers_cache()
 
 
 def remove_whitelist(user_id):
@@ -636,8 +527,6 @@ def remove_whitelist(user_id):
                 "UPDATE users SET whitelisted=FALSE WHERE user_id=%s",
                 (user_id,)
             )
-    update_user_cache(user_id, whitelisted=False)
-    invalidate_receivers_cache()
 # =========================
 # 🚪 JOIN CONTROL
 # =========================
@@ -696,10 +585,24 @@ def get_user_state(user_id):
     if is_whitelisted(user_id):
         return "ACTIVE"
 
-    user = get_user_cached(user_id)
-    if not user or user["username"] is None:
+    username = get_username(user_id)
+
+    if username is None:
         return "NO_USERNAME"
-    last_activation_time = user["last_activation_time"]
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT last_activation_time
+                FROM users
+                WHERE user_id=%s
+            """, (user_id,))
+            row = c.fetchone()
+
+    if not row:
+        return "JOINING"
+
+    last_activation_time = row[0]
 
     if last_activation_time is None:
         return "JOINING"
@@ -783,8 +686,6 @@ def activate_user(user_id):
                     last_activation_time = %s
                 WHERE user_id=%s
             """, (now, user_id))
-    update_user_cache(user_id, last_activation_time=now)
-    invalidate_receivers_cache()
 # =========================
 # ✅ CHECK ACTIVATION
 # =========================
@@ -821,7 +722,6 @@ def auto_ban_inactive_users():
                   AND last_activation_time IS NOT NULL
                   AND last_activation_time < %s
             """, (limit,))
-    invalidate_receivers_cache()
             
 def is_duplicate_filter_enabled():
     with get_connection() as conn:
@@ -983,9 +883,18 @@ def contains_banned_word(text):
     if not text:
         return False
 
-    lower_text = text.lower()
-    with banned_words_cache_lock:
-        return any(w in lower_text for w in banned_words_cache)
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT word FROM banned_words")
+            words = [row[0] for row in c.fetchall()]
+
+    text = text.lower()
+
+    for word in words:
+        if word in text:
+            return True
+
+    return False
 # =========================
 # 🔒 HANDLE RESTRICTIONS
 # =========================
@@ -1306,21 +1215,23 @@ def _process_single(message):
         send_fn = lambda uid: _send_text_with_retry(uid, text_to_send)
     else:
         send_fn = lambda uid: _copy_message_with_retry(uid, sender_id, message.message_id)
-    future_to_uid = {
-        send_executor.submit(send_fn, user_id): user_id
-        for user_id in receivers
-    }
-    for future in as_completed(future_to_uid):
-        user_id = future_to_uid[future]
-        try:
-            sent = future.result()
-            if sent and store_mapping:
-                mappings.append((sent.message_id, sender_id, user_id, now))
-                if len(mappings) >= MAP_INSERT_BATCH_SIZE:
-                    save_mappings(mappings)
-                    mappings.clear()
-        except Exception as e:
-            print("Single send error:", e)
+    workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_uid = {
+            executor.submit(send_fn, user_id): user_id
+            for user_id in receivers
+        }
+        for future in as_completed(future_to_uid):
+            user_id = future_to_uid[future]
+            try:
+                sent = future.result()
+                if sent and store_mapping:
+                    mappings.append((sent.message_id, sender_id, user_id, now))
+                    if len(mappings) >= MAP_INSERT_BATCH_SIZE:
+                        save_mappings(mappings)
+                        mappings.clear()
+            except Exception as e:
+                print("Single send error:", e)
     if store_mapping:
         save_mappings(mappings)
 
@@ -1368,15 +1279,17 @@ def _process_album(messages):
                 time.sleep(FORWARD_DELAY)
         return rows
 
-    futures = [send_executor.submit(send_album_to_user, user_id) for user_id in receivers]
-    for future in as_completed(futures):
-        try:
-            mappings.extend(future.result())
-            if len(mappings) >= MAP_INSERT_BATCH_SIZE:
-                save_mappings(mappings)
-                mappings.clear()
-        except Exception as e:
-            print("Album send error:", e)
+    workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(send_album_to_user, user_id) for user_id in receivers]
+        for future in as_completed(futures):
+            try:
+                mappings.extend(future.result())
+                if len(mappings) >= MAP_INSERT_BATCH_SIZE:
+                    save_mappings(mappings)
+                    mappings.clear()
+            except Exception as e:
+                print("Album send error:", e)
     if store_mapping:
         save_mappings(mappings)
     # external_forward.forward_album(bot, messages)
@@ -1393,8 +1306,6 @@ def relay(message):
 
     if is_maintenance_mode() and not is_admin(message.chat.id):
         bot.send_message(message.chat.id, "Bot is under maintenance. Try again later.")
-        return
-    if not is_admin(message.chat.id) and is_spam(message.chat.id):
         return
 
     if handle_restrictions(message):
@@ -2172,9 +2083,6 @@ if __name__ == "__main__":
 
     init_db_pool()
     init_db()
-    load_admin_cache()
-    load_banned_words()
-    load_all_users_cache()
     print("Database ready.")
 
     start_background_workers()
