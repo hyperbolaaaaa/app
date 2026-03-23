@@ -7,6 +7,7 @@ import time
 import threading
 import queue
 import json
+import re
 import tempfile
 from contextlib import contextmanager
 from collections import defaultdict
@@ -322,6 +323,33 @@ def purge_user_messages(user_id):
                 WHERE original_user_id=%s
             """, (user_id,))
 
+
+def purge_all_mapped_messages():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT receiver_id, bot_message_id
+                FROM message_map
+                """
+            )
+            rows = c.fetchall()
+
+    deleted_count = 0
+    failed_count = 0
+    for receiver_id, bot_message_id in rows:
+        try:
+            bot.delete_message(receiver_id, bot_message_id)
+            deleted_count += 1
+        except:
+            failed_count += 1
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("DELETE FROM message_map")
+
+    return deleted_count, failed_count
+
 def get_original_sender(bot_message_id):
 
     with get_connection() as conn:
@@ -513,9 +541,17 @@ def build_prefix(user_id):
     username = get_username(user_id)
 
     if username:
-        return f"{username}~\n"
+        return f"{username}~ (ID:{user_id})\n"
 
-    return "👤 Unknown\n"
+    return f"👤 Unknown (ID:{user_id})\n"
+
+
+def extract_user_id(msg):
+    text = msg.text or msg.caption or ""
+    match = re.search(r"ID:(\d+)", text)
+    if match:
+        return int(match.group(1))
+    return None
 
 # =========================
 # 🚫 BAN HELPERS
@@ -1595,11 +1631,27 @@ def purge_command(message):
     user_id = get_original_sender(bot_msg_id)
 
     if not user_id:
+        user_id = extract_user_id(message.reply_to_message)
+
+    if not user_id:
         bot.send_message(message.chat.id, "User not found.")
         return
 
     purge_user_messages(user_id)
     bot.send_message(message.chat.id, "🔥 User messages purged.")
+
+
+@bot.message_handler(commands=['purgeall'])
+def purgeall_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    deleted_count, failed_count = purge_all_mapped_messages()
+    bot.send_message(
+        message.chat.id,
+        f"🧨 Purge all complete.\nDeleted: {deleted_count}\nFailed: {failed_count}"
+    )
 @bot.message_handler(commands=['panel'])
 def admin_panel(message):
 
@@ -1745,6 +1797,9 @@ def info_command(message):
     user_id = get_original_sender(bot_msg_id)
 
     if not user_id:
+        user_id = extract_user_id(message.reply_to_message)
+
+    if not user_id:
         bot.send_message(message.chat.id, "User not found.")
         return
 
@@ -1797,6 +1852,9 @@ def ban_command(message):
     if message.reply_to_message:
         bot_msg_id = message.reply_to_message.message_id
         target_id = get_original_sender(bot_msg_id)
+
+        if not target_id:
+            target_id = extract_user_id(message.reply_to_message)
 
         if not target_id:
             bot.send_message(message.chat.id, "User not found.")
@@ -2036,6 +2094,9 @@ def admin_menu(message):
 
 🧹 /clearmap  
 → Clear message mapping table
+
+🧨 /purgeall
+→ Delete all mapped relayed messages from all users
 
 📦 /addword WORD  
 → Add banned word
