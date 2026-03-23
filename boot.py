@@ -6,6 +6,8 @@ import os
 import time
 import threading
 import queue
+import json
+import tempfile
 from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,6 +37,10 @@ RECEIVER_CACHE_TTL = int(os.getenv("RECEIVER_CACHE_TTL", "10"))
 BROADCAST_QUEUE_SIZE = int(os.getenv("BROADCAST_QUEUE_SIZE", "2000"))
 DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
 DB_POOL_MAX_CONN = int(os.getenv("DB_POOL_MAX_CONN", "15"))
+MESSAGE_MAP_MODE = os.getenv("MESSAGE_MAP_MODE", "full").strip().lower()
+MAP_RETENTION_DAYS = int(os.getenv("MAP_RETENTION_DAYS", "2"))
+MAP_CLEANUP_INTERVAL_SECONDS = int(os.getenv("MAP_CLEANUP_INTERVAL_SECONDS", "300"))
+MAP_INSERT_BATCH_SIZE = int(os.getenv("MAP_INSERT_BATCH_SIZE", "100"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
@@ -55,6 +61,7 @@ db_pool = None
 receiver_cache_lock = threading.Lock()
 receiver_cache = []
 receiver_cache_at = 0.0
+pending_recovery_import = set()
 
 # =========================
 # 🗄 DATABASE CONNECTION
@@ -113,6 +120,12 @@ def init_db():
                     last_activation_time BIGINT
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS recovery_users (
+                    username TEXT PRIMARY KEY,
+                    banned BOOLEAN DEFAULT FALSE
+                )
+            """)
 
             # =========================
             # ADMINS TABLE
@@ -134,6 +147,9 @@ def init_db():
                     created_at BIGINT
                 )
             """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_bot_msg ON message_map(bot_message_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_original_user ON message_map(original_user_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON message_map(created_at)")
 
             # =========================
             # BANNED WORDS TABLE
@@ -323,6 +339,84 @@ def username_taken(username):
                 (username.lower(),)
             )
             return c.fetchone() is not None
+
+
+def get_recovery_ban_for_username(username):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT banned FROM recovery_users WHERE username=%s",
+                (username.lower(),),
+            )
+            row = c.fetchone()
+            return bool(row and row[0])
+
+
+def export_recovery_payload():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT username, banned
+                FROM users
+                WHERE username IS NOT NULL
+                ORDER BY username
+                """
+            )
+            users = [{"username": r[0], "banned": bool(r[1])} for r in c.fetchall()]
+            c.execute("SELECT word FROM banned_words ORDER BY word")
+            words = [r[0] for r in c.fetchall()]
+    return {
+        "version": 1,
+        "exported_at": int(time.time()),
+        "users": users,
+        "banned_words": words,
+    }
+
+
+def import_recovery_payload(payload):
+    users = payload.get("users", [])
+    words = payload.get("banned_words", [])
+
+    imported_users = 0
+    imported_words = 0
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            for item in users:
+                username = str(item.get("username", "")).strip().lower()
+                if not username:
+                    continue
+                banned = bool(item.get("banned", False))
+                c.execute(
+                    """
+                    INSERT INTO recovery_users(username, banned)
+                    VALUES(%s, %s)
+                    ON CONFLICT (username) DO UPDATE SET banned=EXCLUDED.banned
+                    """,
+                    (username, banned),
+                )
+                imported_users += 1
+
+            for word in words:
+                clean_word = str(word).strip().lower()
+                if not clean_word:
+                    continue
+                c.execute(
+                    "INSERT INTO banned_words(word) VALUES(%s) ON CONFLICT DO NOTHING",
+                    (clean_word,),
+                )
+                imported_words += 1
+
+            c.execute(
+                """
+                UPDATE users u
+                SET banned = r.banned
+                FROM recovery_users r
+                WHERE u.username = r.username
+                """
+            )
+
+    return imported_users, imported_words
 # =========================
 # 👑 ADMIN HELPERS
 # =========================
@@ -335,6 +429,14 @@ def is_admin(user_id):
                 (user_id,)
             )
             return c.fetchone() is not None
+
+
+def should_store_mapping(sender_id):
+    if MESSAGE_MAP_MODE == "off":
+        return False
+    if MESSAGE_MAP_MODE == "admin_only":
+        return is_admin(sender_id)
+    return True
 
 
 def add_admin(user_id):
@@ -763,6 +865,10 @@ def capture_username(message):
         return
 
     set_username(user_id, username)
+    if get_recovery_ban_for_username(username):
+        ban_user(user_id)
+        bot.send_message(user_id, "Username recovered from backup with banned status.")
+        return
 
     bot.send_message(
         user_id,
@@ -1098,6 +1204,7 @@ def _process_single(message):
 
     sender_id = message.chat.id
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    store_mapping = should_store_mapping(sender_id)
     mappings = []
     now = int(time.time())
     prefix = build_prefix(sender_id)
@@ -1118,11 +1225,15 @@ def _process_single(message):
             user_id = future_to_uid[future]
             try:
                 sent = future.result()
-                if sent:
+                if sent and store_mapping:
                     mappings.append((sent.message_id, sender_id, user_id, now))
+                    if len(mappings) >= MAP_INSERT_BATCH_SIZE:
+                        save_mappings(mappings)
+                        mappings.clear()
             except Exception as e:
                 print("Single send error:", e)
-    save_mappings(mappings)
+    if store_mapping:
+        save_mappings(mappings)
 
    
 # =========================
@@ -1133,6 +1244,7 @@ def _process_album(messages):
 
     sender_id = messages[0].chat.id
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    store_mapping = should_store_mapping(sender_id)
     mappings = []
     now = int(time.time())
     if not receivers:
@@ -1160,8 +1272,9 @@ def _process_album(messages):
         rows = []
         for chunk in chunks:
             sent_msgs = bot.send_media_group(user_id, chunk)
-            for sent in sent_msgs:
-                rows.append((sent.message_id, sender_id, user_id, now))
+            if store_mapping:
+                for sent in sent_msgs:
+                    rows.append((sent.message_id, sender_id, user_id, now))
             if FORWARD_DELAY > 0:
                 time.sleep(FORWARD_DELAY)
         return rows
@@ -1172,9 +1285,13 @@ def _process_album(messages):
         for future in as_completed(futures):
             try:
                 mappings.extend(future.result())
+                if len(mappings) >= MAP_INSERT_BATCH_SIZE:
+                    save_mappings(mappings)
+                    mappings.clear()
             except Exception as e:
                 print("Album send error:", e)
-    save_mappings(mappings)
+    if store_mapping:
+        save_mappings(mappings)
     # external_forward.forward_album(bot, messages)
 
 # =========================
@@ -1296,8 +1413,6 @@ def inactivity_scheduler():
 # 🧹 MESSAGE MAP CLEANUP
 # =========================
 
-MAP_RETENTION_DAYS = 7
-
 def message_map_cleanup_scheduler():
 
     while True:
@@ -1313,7 +1428,7 @@ def message_map_cleanup_scheduler():
         except Exception as e:
             print("Cleanup error:", e)
 
-        time.sleep(3600)  # run every hour
+        time.sleep(MAP_CLEANUP_INTERVAL_SECONDS)
 # =========================
 # 🚀 START BACKGROUND WORKERS
 # =========================
@@ -1449,6 +1564,10 @@ def admin_panel(message):
     markup.add(
         InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned"),
         InlineKeyboardButton("⚙ Settings", callback_data="admin_settings")
+    )
+    markup.add(
+        InlineKeyboardButton("Export Recovery", callback_data="admin_export_recovery"),
+        InlineKeyboardButton("Import Recovery", callback_data="admin_import_recovery")
     )
 
     bot.send_message(
@@ -1906,7 +2025,47 @@ def admin_callbacks(call):
 
         bot.send_message(call.message.chat.id, text)
 
+    elif data == "admin_export_recovery":
+        payload = export_recovery_payload()
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                temp_path = f.name
+            with open(temp_path, "rb") as doc:
+                bot.send_document(call.message.chat.id, doc, caption="Recovery export (username+banned+banned_words)")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    elif data == "admin_import_recovery":
+        pending_recovery_import.add(call.message.chat.id)
+        bot.send_message(call.message.chat.id, "Send the recovery JSON file as a document to import.")
+
     bot.answer_callback_query(call.id)
+
+
+@bot.message_handler(content_types=['document'])
+def import_recovery_document(message):
+    if not is_admin(message.chat.id):
+        return
+    if message.chat.id not in pending_recovery_import:
+        return
+
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        raw = bot.download_file(file_info.file_path)
+        payload = json.loads(raw.decode("utf-8"))
+        imported_users, imported_words = import_recovery_payload(payload)
+        pending_recovery_import.discard(message.chat.id)
+        bot.send_message(
+            message.chat.id,
+            f"Recovery import complete.\nUsers imported: {imported_users}\nBanned words imported: {imported_words}",
+        )
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Import failed: {e}")
+
+
 @bot.message_handler(commands=['chatid'], content_types=['text'])
 def get_chat_id(message):
     bot.reply_to(message, f"Chat ID: {message.chat.id}")
