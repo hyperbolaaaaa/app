@@ -238,9 +238,12 @@ def delete_message_globally(bot_message_id):
             """, (bot_message_id,))
             rows = c.fetchall()
 
+    deleted_count = 0
+
     for row in rows:
         try:
             bot.delete_message(row[0], bot_message_id)
+            deleted_count += 1
         except:
             pass
 
@@ -250,6 +253,7 @@ def delete_message_globally(bot_message_id):
                 DELETE FROM message_map
                 WHERE bot_message_id=%s
             """, (bot_message_id,))
+    return deleted_count
 def purge_user_messages(user_id):
 
     with get_connection() as conn:
@@ -431,11 +435,15 @@ def is_admin(user_id):
             return c.fetchone() is not None
 
 
-def should_store_mapping(sender_id):
+def should_store_mapping(sender_id, receivers=None):
     if MESSAGE_MAP_MODE == "off":
         return False
     if MESSAGE_MAP_MODE == "admin_only":
-        return is_admin(sender_id)
+        if is_admin(sender_id):
+            return True
+        if receivers:
+            return any(is_admin(uid) for uid in receivers)
+        return False
     return True
 
 
@@ -1204,7 +1212,7 @@ def _process_single(message):
 
     sender_id = message.chat.id
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
-    store_mapping = should_store_mapping(sender_id)
+    store_mapping = should_store_mapping(sender_id, receivers)
     mappings = []
     now = int(time.time())
     prefix = build_prefix(sender_id)
@@ -1244,7 +1252,7 @@ def _process_album(messages):
 
     sender_id = messages[0].chat.id
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
-    store_mapping = should_store_mapping(sender_id)
+    store_mapping = should_store_mapping(sender_id, receivers)
     mappings = []
     now = int(time.time())
     if not receivers:
@@ -1499,9 +1507,15 @@ def delete_command(message):
 
     bot_msg_id = message.reply_to_message.message_id
 
-    delete_message_globally(bot_msg_id)
+    deleted_count = delete_message_globally(bot_msg_id)
+    if deleted_count == 0:
+        bot.send_message(
+            message.chat.id,
+            "No mapping found for this message. It may be old/cleaned or mapping mode is too strict."
+        )
+        return
 
-    bot.send_message(message.chat.id, "🗑 Message deleted everywhere.")
+    bot.send_message(message.chat.id, f"🗑 Message deleted in {deleted_count} chats.")
 @bot.message_handler(commands=['addforward'])
 def add_forward_target_cmd(message):
 
