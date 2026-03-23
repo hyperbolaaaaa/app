@@ -1,5 +1,5 @@
 # =========================
-# 📦 IMPORTS
+# ðŸ“¦ IMPORTS
 # =========================
 
 import os
@@ -20,7 +20,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
 # =========================
-# ⚙ CONFIGURATION
+# âš™ CONFIGURATION
 # =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -51,9 +51,6 @@ bot = telebot.TeleBot(BOT_TOKEN)
 broadcast_queue = queue.Queue(maxsize=BROADCAST_QUEUE_SIZE)
 media_groups = defaultdict(list)
 album_timers = {}
-user_media_buffer = defaultdict(list)
-user_media_timer = {}
-media_buffer_lock = threading.Lock()
 activation_buffer = defaultdict(int)
 activation_timer = {}
 activation_lock = threading.Lock()
@@ -64,7 +61,7 @@ receiver_cache_at = 0.0
 pending_recovery_import = set()
 
 # =========================
-# 🗄 DATABASE CONNECTION
+# ðŸ—„ DATABASE CONNECTION
 # =========================
 
 def init_db_pool():
@@ -97,7 +94,7 @@ def get_connection():
         else:
             conn.close()
 # =========================
-# 🧱 DATABASE INITIALIZATION
+# ðŸ§± DATABASE INITIALIZATION
 # =========================
 
 def init_db():
@@ -176,6 +173,11 @@ def init_db():
                     value TEXT
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS forward_targets (
+                    chat_id BIGINT PRIMARY KEY
+                )
+            """)
 
             # Default Join Setting
             c.execute("""
@@ -184,7 +186,7 @@ def init_db():
                 ON CONFLICT DO NOTHING
             """)
             # =========================
-            # 📦 DUPLICATE TRACKING
+            # ðŸ“¦ DUPLICATE TRACKING
             # =========================
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_duplicates (
@@ -196,7 +198,7 @@ def init_db():
             # Default Welcome Message
             c.execute("""
                 INSERT INTO settings(key, value)
-                VALUES('welcome_message', '👋 Welcome!\n\nPlease drop your username:')
+                VALUES('welcome_message', 'ðŸ‘‹ Welcome!\n\nPlease drop your username:')
                 ON CONFLICT DO NOTHING
             """)
 
@@ -232,7 +234,7 @@ def init_db():
                     print("Admin init error:", e)
 
 # =========================
-# 👤 USER EXISTENCE
+# ðŸ‘¤ USER EXISTENCE
 # =========================
 def delete_message_globally(receiver_id, bot_message_id):
     with get_connection() as conn:
@@ -322,6 +324,30 @@ def purge_user_messages(user_id):
                 WHERE original_user_id=%s
             """, (user_id,))
 
+def purge_all_user_messages():
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT bot_message_id, receiver_id
+                FROM message_map
+            """)
+            rows = c.fetchall()
+
+    deleted_count = 0
+    for bot_msg_id, receiver_id in rows:
+        try:
+            bot.delete_message(receiver_id, bot_msg_id)
+            deleted_count += 1
+        except:
+            pass
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("DELETE FROM message_map")
+
+    return deleted_count
+
 def get_original_sender(bot_message_id):
 
     with get_connection() as conn:
@@ -355,7 +381,7 @@ def add_user(user_id):
                 ON CONFLICT DO NOTHING
             """, (user_id,))
 # =========================
-# 🏷 USERNAME HELPERS
+# ðŸ· USERNAME HELPERS
 # =========================
 
 def get_username(user_id):
@@ -466,7 +492,7 @@ def import_recovery_payload(payload):
 
     return imported_users, imported_words
 # =========================
-# 👑 ADMIN HELPERS
+# ðŸ‘‘ ADMIN HELPERS
 # =========================
 
 def is_admin(user_id):
@@ -508,6 +534,26 @@ def remove_admin(user_id):
                 "DELETE FROM admins WHERE user_id=%s",
                 (user_id,)
             )
+
+def add_forward_target(chat_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO forward_targets(chat_id)
+                VALUES(%s)
+                ON CONFLICT DO NOTHING
+                """,
+                (chat_id,),
+            )
+
+
+def get_forward_targets():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT chat_id FROM forward_targets")
+            return [row[0] for row in c.fetchall()]
+
 def build_prefix(user_id):
 
     username = get_username(user_id)
@@ -515,10 +561,10 @@ def build_prefix(user_id):
     if username:
         return f"{username}~\n"
 
-    return "👤 Unknown\n"
+    return "ðŸ‘¤ Unknown\n"
 
 # =========================
-# 🚫 BAN HELPERS
+# ðŸš« BAN HELPERS
 # =========================
 
 def is_banned(user_id):
@@ -549,7 +595,7 @@ def unban_user(user_id):
                 (user_id,)
             )
 # =========================
-# ⭐ WHITELIST HELPERS
+# â­ WHITELIST HELPERS
 # =========================
 
 def is_whitelisted(user_id):
@@ -580,7 +626,7 @@ def remove_whitelist(user_id):
                 (user_id,)
             )
 # =========================
-# 🚪 JOIN CONTROL
+# ðŸšª JOIN CONTROL
 # =========================
 
 def is_join_open():
@@ -623,7 +669,7 @@ def set_maintenance_mode(status: bool):
                 ("true" if status else "false",),
             )
 # =========================
-# 🧠 USER STATE RESOLVER
+# ðŸ§  USER STATE RESOLVER
 # =========================
 
 def get_user_state(user_id):
@@ -664,7 +710,7 @@ def get_user_state(user_id):
 
     return "ACTIVE"
 # =========================
-# 📊 GET ACTIVATION DATA
+# ðŸ“Š GET ACTIVATION DATA
 # =========================
 
 def get_activation_data(user_id):
@@ -688,7 +734,7 @@ def get_activation_data(user_id):
             """, (user_id,))
             return c.fetchone()
 # =========================
-# 📈 INCREMENT MEDIA
+# ðŸ“ˆ INCREMENT MEDIA
 # =========================
 
 def increment_media(user_id, amount=1):
@@ -711,7 +757,7 @@ def get_welcome_message():
                 "SELECT value FROM settings WHERE key='welcome_message'"
             )
             row = c.fetchone()
-            return row[0] if row else "👋 Welcome!"
+            return row[0] if row else "ðŸ‘‹ Welcome!"
 
 def set_welcome_message(text):
     with get_connection() as conn:
@@ -722,7 +768,7 @@ def set_welcome_message(text):
                 WHERE key='welcome_message'
             """, (text,))
 # =========================
-# 🔄 ACTIVATE USER
+# ðŸ”„ ACTIVATE USER
 # =========================
 
 def activate_user(user_id):
@@ -739,7 +785,7 @@ def activate_user(user_id):
                 WHERE user_id=%s
             """, (now, user_id))
 # =========================
-# ✅ CHECK ACTIVATION
+# âœ… CHECK ACTIVATION
 # =========================
 
 def check_activation(user_id):
@@ -757,7 +803,7 @@ def check_activation(user_id):
 
     return False
 # =========================
-# ⏳ AUTO INACTIVITY CHECK
+# â³ AUTO INACTIVITY CHECK
 # =========================
 
 def auto_ban_inactive_users():
@@ -825,7 +871,7 @@ def check_and_register_duplicate(file_id, sender_id):
                 """, (file_id, sender_id))
                 return False
 # =========================
-# 🚪 START COMMAND
+# ðŸšª START COMMAND
 # =========================
 
 @bot.message_handler(commands=['start'])
@@ -837,12 +883,12 @@ def start_command(message):
         bot.send_message(user_id, "Bot is under maintenance. Try again later.")
         return
 
-    # 🚫 Manual Ban
+    # ðŸš« Manual Ban
     if is_banned(user_id):
-        bot.send_message(user_id, "🚫 You are banned.")
+        bot.send_message(user_id, "ðŸš« You are banned.")
         return
 
-    # 👑 Admin Auto Registration
+    # ðŸ‘‘ Admin Auto Registration
     if is_admin(user_id):
         if not user_exists(user_id):
             add_user(user_id)
@@ -850,22 +896,22 @@ def start_command(message):
         if get_username(user_id) is None:
             set_username(user_id, "admin")
 
-        bot.send_message(user_id, "👑 Admin access granted.")
+        bot.send_message(user_id, "ðŸ‘‘ Admin access granted.")
         return
 
-    # 🆕 New User
+    # ðŸ†• New User
     if not user_exists(user_id):
 
         if not is_join_open():
             bot.send_message(
                 user_id,
-                "🚪 Joining is currently closed."
+                "ðŸšª Joining is currently closed."
             )
             return
 
         add_user(user_id)
 
-    # 🏷 Ask Username If Not Set
+    # ðŸ· Ask Username If Not Set
     if get_username(user_id) is None:
         bot.send_message(
             user_id,
@@ -874,25 +920,25 @@ def start_command(message):
         
         return
 
-    # 🧠 Show Current State
+    # ðŸ§  Show Current State
     state = get_user_state(user_id)
 
     if state == "JOINING":
         bot.send_message(
             user_id,
-            f"🔒 Send {REQUIRED_MEDIA} media to join."
+            f"ðŸ”’ Send {REQUIRED_MEDIA} media to join."
         )
 
     elif state == "INACTIVE":
         bot.send_message(
             user_id,
-            f"⏳ You are inactive.\nSend {REQUIRED_MEDIA} media to reactivate."
+            f"â³ You are inactive.\nSend {REQUIRED_MEDIA} media to reactivate."
         )
 
     else:
-        bot.send_message(user_id, "👋 Welcome back!")
+        bot.send_message(user_id, "ðŸ‘‹ Welcome back!")
 # =========================
-# 🏷 USERNAME CAPTURE
+# ðŸ· USERNAME CAPTURE
 # =========================
 
 @bot.message_handler(
@@ -924,10 +970,10 @@ def capture_username(message):
 
     bot.send_message(
         user_id,
-        f"✅ {username} set.\n\nNow send {REQUIRED_MEDIA} media to join."
+        f"âœ… {username} set.\n\nNow send {REQUIRED_MEDIA} media to join."
     )
 # =========================
-# 🚫 BANNED WORD CHECK
+# ðŸš« BANNED WORD CHECK
 # =========================
 
 def contains_banned_word(text):
@@ -948,7 +994,7 @@ def contains_banned_word(text):
 
     return False
 # =========================
-# 🔒 HANDLE RESTRICTIONS
+# ðŸ”’ HANDLE RESTRICTIONS
 # =========================
 
 def handle_restrictions(message):
@@ -956,35 +1002,35 @@ def handle_restrictions(message):
     user_id = message.chat.id
     state = get_user_state(user_id)
 
-    # 🚫 Manual Ban
+    # ðŸš« Manual Ban
     if state == "BANNED":
-        bot.send_message(user_id, "🚫 You are banned.")
+        bot.send_message(user_id, "ðŸš« You are banned.")
         return True
 
-    # 👑 Admin Bypass
+    # ðŸ‘‘ Admin Bypass
     if state == "ADMIN":
         return False
 
-    # ⭐ Whitelisted = Always Active
+    # â­ Whitelisted = Always Active
     if is_whitelisted(user_id):
         return False
 
-    # 🚫 Word Filter (text only)
+    # ðŸš« Word Filter (text only)
     if message.content_type == "text":
         if contains_banned_word(message.text):
-            bot.send_message(user_id, "🚫 Message contains banned word.")
+            bot.send_message(user_id, "ðŸš« Message contains banned word.")
             return True
 
-    # ❌ No Username Yet
+    # âŒ No Username Yet
     if state == "NO_USERNAME":
         bot.send_message(
             user_id,
-            "⚠️ Please set username first using /start."
+            "âš ï¸ Please set username first using /start."
         )
         return True
 
     # =========================
-    # 🟡 JOINING STATE
+    # ðŸŸ¡ JOINING STATE
     # =========================
     if state == "JOINING":
 
@@ -1013,13 +1059,13 @@ def handle_restrictions(message):
                     if activated:
                         bot.send_message(
                             user_id,
-                            "🎉 You are now active for 6 hours!"
+                            "ðŸŽ‰ You are now active for 6 hours!"
                         )
                     else:
                         remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
                         bot.send_message(
                             user_id,
-                            f"📸 {remaining} media left to join."
+                            f"ðŸ“¸ {remaining} media left to join."
                         )
 
             threading.Thread(target=finalize_activation).start()
@@ -1028,13 +1074,13 @@ def handle_restrictions(message):
 
         bot.send_message(
             user_id,
-            f"🔒 Send {REQUIRED_MEDIA} media to join."
+            f"ðŸ”’ Send {REQUIRED_MEDIA} media to join."
         )
         return True
 
 
     # =========================
-    # 🔴 INACTIVE STATE
+    # ðŸ”´ INACTIVE STATE
     # =========================
     if state == "INACTIVE":
 
@@ -1063,13 +1109,13 @@ def handle_restrictions(message):
                     if activated:
                         bot.send_message(
                             user_id,
-                            "🎉 You are reactivated for 6 hours!"
+                            "ðŸŽ‰ You are reactivated for 6 hours!"
                         )
                     else:
                         remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
                         bot.send_message(
                             user_id,
-                            f"📸 {remaining} media left to reactivate."
+                            f"ðŸ“¸ {remaining} media left to reactivate."
                         )
 
             threading.Thread(target=finalize_reactivation).start()
@@ -1078,13 +1124,13 @@ def handle_restrictions(message):
 
         bot.send_message(
             user_id,
-            f"⏳ You are inactive.\nSend {REQUIRED_MEDIA} media to reactivate."
+            f"â³ You are inactive.\nSend {REQUIRED_MEDIA} media to reactivate."
         )
         return True
 
 
     # =========================
-    # 🟢 ACTIVE STATE
+    # ðŸŸ¢ ACTIVE STATE
     # =========================
     if state == "ACTIVE":
 
@@ -1095,7 +1141,7 @@ def handle_restrictions(message):
 
         return False
 # =========================
-# 📥 GET ACTIVE RECEIVERS
+# ðŸ“¥ GET ACTIVE RECEIVERS
 # =========================
 
 def get_active_receivers():
@@ -1131,7 +1177,7 @@ def get_receivers_cached(force=False):
         return list(receiver_cache)
 
 # =========================
-# 📝 SAVE MESSAGE MAP
+# ðŸ“ SAVE MESSAGE MAP
 # =========================
 
 def save_mapping(bot_msg_id, original_user_id, original_message_id, receiver_id):
@@ -1228,7 +1274,7 @@ def _send_text_with_retry(user_id, text):
             return None
     return None
 # =========================
-# 🚀 BROADCAST WORKER
+# ðŸš€ BROADCAST WORKER
 # =========================
 
 def broadcast_worker():
@@ -1250,29 +1296,31 @@ def broadcast_worker():
 
         broadcast_queue.task_done()
 # =========================
-# 📤 PROCESS SINGLE MESSAGE
+# ðŸ“¤ PROCESS SINGLE MESSAGE
 # =========================
 
 def _process_single(message):
 
     sender_id = message.chat.id
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
-    store_mapping = should_store_mapping(sender_id, receivers)
+    extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
+    targets = list(dict.fromkeys(receivers + extra_targets))
+    store_mapping = should_store_mapping(sender_id, targets)
     mappings = []
     now = int(time.time())
     prefix = build_prefix(sender_id)
-    if not receivers:
+    if not targets:
         return
     if message.content_type == "text":
         text_to_send = prefix + (message.text or "")
         send_fn = lambda uid: _send_text_with_retry(uid, text_to_send)
     else:
         send_fn = lambda uid: _copy_message_with_retry(uid, sender_id, message.message_id)
-    workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
+    workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_uid = {
             executor.submit(send_fn, user_id): user_id
-            for user_id in receivers
+            for user_id in targets
         }
         for future in as_completed(future_to_uid):
             user_id = future_to_uid[future]
@@ -1290,17 +1338,19 @@ def _process_single(message):
 
    
 # =========================
-# 📸 PROCESS ALBUM MESSAGE
+# ðŸ“¸ PROCESS ALBUM MESSAGE
 # =========================
 
 def _process_album(messages):
 
     sender_id = messages[0].chat.id
     receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
-    store_mapping = should_store_mapping(sender_id, receivers)
+    extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
+    targets = list(dict.fromkeys(receivers + extra_targets))
+    store_mapping = should_store_mapping(sender_id, targets)
     mappings = []
     now = int(time.time())
-    if not receivers:
+    if not targets:
         return
     prefix = build_prefix(sender_id)
     media_items = []
@@ -1335,9 +1385,9 @@ def _process_album(messages):
                 time.sleep(FORWARD_DELAY)
         return rows
 
-    workers = max(1, min(SEND_MAX_WORKERS, len(receivers)))
+    workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(send_album_to_user, user_id) for user_id in receivers]
+        futures = [executor.submit(send_album_to_user, user_id) for user_id in targets]
         for future in as_completed(futures):
             try:
                 mappings.extend(future.result())
@@ -1351,7 +1401,7 @@ def _process_album(messages):
     # external_forward.forward_album(bot, messages)
 
 # =========================
-# 🔁 RELAY HANDLER
+# ðŸ” RELAY HANDLER
 # =========================
 
 @bot.message_handler(
@@ -1367,7 +1417,7 @@ def relay(message):
     if handle_restrictions(message):
         return
     # =========================
-    # ♻ DUPLICATE FILTER (EARLY)
+    # â™» DUPLICATE FILTER (EARLY)
     # =========================
     if message.content_type in ['photo', 'video'] and is_duplicate_filter_enabled():
 
@@ -1382,7 +1432,7 @@ def relay(message):
         if is_dup:
             return  # silently ignore and DO NOT count activation
     # =========================
-    # 1️⃣ TELEGRAM ALBUM
+    # 1ï¸âƒ£ TELEGRAM ALBUM
     # =========================
     if message.media_group_id:
 
@@ -1410,50 +1460,24 @@ def relay(message):
         return
 
     # =========================
-    # 2️⃣ MANUAL MEDIA BUFFER
+    # 2ï¸âƒ£ SINGLE PHOTO/VIDEO
     # =========================
     if message.content_type in ['photo', 'video']:
-
-        user_id = message.chat.id
-
-        with media_buffer_lock:
-            user_media_buffer[user_id].append(message)
-
-            if user_id in user_media_timer:
-                return
-
-            user_media_timer[user_id] = True
-
-        def finalize_user():
-            time.sleep(1.2)
-
-            with media_buffer_lock:
-                media_list = user_media_buffer.pop(user_id, [])
-                user_media_timer.pop(user_id, None)
-
-            if len(media_list) == 1:
-                broadcast_queue.put({
-                    "type": "single",
-                    "message": media_list[0]
-                })
-            else:
-                broadcast_queue.put({
-                    "type": "album",
-                    "messages": media_list
-                })
-
-        threading.Thread(target=finalize_user).start()
+        broadcast_queue.put({
+            "type": "single",
+            "message": message
+        })
         return
 
     # =========================
-    # 3️⃣ TEXT
+    # 3ï¸âƒ£ TEXT
     # =========================
     broadcast_queue.put({
         "type": "single",
         "message": message
     })
 # =========================
-# ⏳ INACTIVITY SCHEDULER
+# â³ INACTIVITY SCHEDULER
 # =========================
 
 def inactivity_scheduler():
@@ -1466,7 +1490,7 @@ def inactivity_scheduler():
 
         time.sleep(60)  # check every 60 seconds
 # =========================
-# 🧹 MESSAGE MAP CLEANUP
+# ðŸ§¹ MESSAGE MAP CLEANUP
 # =========================
 
 def message_map_cleanup_scheduler():
@@ -1486,7 +1510,7 @@ def message_map_cleanup_scheduler():
 
         time.sleep(MAP_CLEANUP_INTERVAL_SECONDS)
 # =========================
-# 🚀 START BACKGROUND WORKERS
+# ðŸš€ START BACKGROUND WORKERS
 # =========================
 
 def start_background_workers():
@@ -1519,7 +1543,7 @@ def enable_duplicate_filter(message):
         return
 
     set_duplicate_filter(True)
-    bot.send_message(message.chat.id, "✅ Duplicate filter ENABLED.")
+    bot.send_message(message.chat.id, "âœ… Duplicate filter ENABLED.")
 
 
 @bot.message_handler(commands=['dupoff'])
@@ -1529,7 +1553,7 @@ def disable_duplicate_filter(message):
         return
 
     set_duplicate_filter(False)
-    bot.send_message(message.chat.id, "❌ Duplicate filter DISABLED.")
+    bot.send_message(message.chat.id, "âŒ Duplicate filter DISABLED.")
 
 
 @bot.message_handler(commands=['dupstatus'])
@@ -1538,10 +1562,10 @@ def duplicate_status(message):
         return
 
     status = "ON" if is_duplicate_filter_enabled() else "OFF"
-    bot.send_message(message.chat.id, f"♻ Duplicate filter is {status}")
+    bot.send_message(message.chat.id, f"â™» Duplicate filter is {status}")
 
     set_duplicate_filter(False)
-    bot.send_message(message.chat.id, "❌ Duplicate filter disabled.")
+    bot.send_message(message.chat.id, "âŒ Duplicate filter disabled.")
     
 @bot.message_handler(commands=['del'])
 def delete_command(message):
@@ -1563,23 +1587,42 @@ def delete_command(message):
         )
         return
 
-    bot.send_message(message.chat.id, f"🗑 Message deleted in {deleted_count} chats.")
+    bot.send_message(message.chat.id, f"ðŸ—‘ Message deleted in {deleted_count} chats.")
 @bot.message_handler(commands=['addforward'])
 def add_forward_target_cmd(message):
 
     if not is_admin(message.chat.id):
         return
 
+    chat_id = None
+    target_name = None
     parts = message.text.split()
 
-    if len(parts) < 2:
-        bot.send_message(message.chat.id, "Usage: /addforward CHAT_ID")
+    if len(parts) >= 2:
+        try:
+            chat_id = int(parts[1])
+        except:
+            bot.send_message(message.chat.id, "Invalid CHAT_ID.")
+            return
+    elif message.reply_to_message:
+        source_chat = getattr(message.reply_to_message, "forward_from_chat", None)
+        if source_chat:
+            chat_id = source_chat.id
+            target_name = getattr(source_chat, "title", None)
+
+    if chat_id is None:
+        bot.send_message(
+            message.chat.id,
+            "Usage: /addforward CHAT_ID\nOr reply to a forwarded message from the target group/channel."
+        )
         return
 
-    chat_id = int(parts[1])
-    # external_forward.add_forward_target(chat_id)
+    add_forward_target(chat_id)
 
-    bot.send_message(message.chat.id, "Forward target added.")
+    if target_name:
+        bot.send_message(message.chat.id, f"Forward target added: {target_name} ({chat_id})")
+    else:
+        bot.send_message(message.chat.id, f"Forward target added: {chat_id}")
 
 @bot.message_handler(commands=['purge'])
 def purge_command(message):
@@ -1599,7 +1642,19 @@ def purge_command(message):
         return
 
     purge_user_messages(user_id)
-    bot.send_message(message.chat.id, "🔥 User messages purged.")
+    bot.send_message(message.chat.id, "ðŸ”¥ User messages purged.")
+@bot.message_handler(commands=['apurgeall'])
+def apurgeall_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    deleted_count = purge_all_user_messages()
+    bot.send_message(
+        message.chat.id,
+        f"Purged all mapped user messages. Deleted: {deleted_count}"
+    )
+
 @bot.message_handler(commands=['panel'])
 def admin_panel(message):
 
@@ -1609,23 +1664,23 @@ def admin_panel(message):
     markup = InlineKeyboardMarkup(row_width=2)
 
     markup.add(
-        InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
-        InlineKeyboardButton("👥 Users", callback_data="admin_users")
+        InlineKeyboardButton("ðŸ“Š Stats", callback_data="admin_stats"),
+        InlineKeyboardButton("ðŸ‘¥ Users", callback_data="admin_users")
     )
 
     markup.add(
-        InlineKeyboardButton("🚪 Open Join", callback_data="admin_open_join"),
-        InlineKeyboardButton("🔒 Close Join", callback_data="admin_close_join")
+        InlineKeyboardButton("ðŸšª Open Join", callback_data="admin_open_join"),
+        InlineKeyboardButton("ðŸ”’ Close Join", callback_data="admin_close_join")
     )
 
     markup.add(
-        InlineKeyboardButton("⭐ Whitelist", callback_data="admin_whitelist"),
-        InlineKeyboardButton("🧹 Clear Map", callback_data="admin_clearmap")
+        InlineKeyboardButton("â­ Whitelist", callback_data="admin_whitelist"),
+        InlineKeyboardButton("ðŸ§¹ Clear Map", callback_data="admin_clearmap")
     )
 
     markup.add(
-        InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned"),
-        InlineKeyboardButton("⚙ Settings", callback_data="admin_settings")
+        InlineKeyboardButton("ðŸš« Banned List", callback_data="admin_banned"),
+        InlineKeyboardButton("âš™ Settings", callback_data="admin_settings")
     )
     markup.add(
         InlineKeyboardButton("Export Recovery", callback_data="admin_export_recovery"),
@@ -1634,7 +1689,7 @@ def admin_panel(message):
 
     bot.send_message(
         message.chat.id,
-        "🛠 Admin Control Panel",
+        "ðŸ›  Admin Control Panel",
         reply_markup=markup
     )
 @bot.message_handler(commands=['setwelcome'])
@@ -1660,7 +1715,7 @@ def set_welcome_cmd(message):
 
     bot.send_message(
         message.chat.id,
-        "✅ Welcome message updated."
+        "âœ… Welcome message updated."
     )
 
 @bot.message_handler(commands=['stats'])
@@ -1719,16 +1774,16 @@ def stats_command(message):
     bot.send_message(
         message.chat.id,
         f"""
-📊 BOT STATS
+ðŸ“Š BOT STATS
 
-👥 Total: {total}
-🟢 Active: {active}
-🔴 Inactive: {inactive}
-🚫 Banned: {banned}
-⭐ Whitelisted: {whitelisted}
-♻ Duplicate Media: {duplicate_total}
-📦 Message Map Rows: {map_count}
-🚪 Join: {join_status}
+ðŸ‘¥ Total: {total}
+ðŸŸ¢ Active: {active}
+ðŸ”´ Inactive: {inactive}
+ðŸš« Banned: {banned}
+â­ Whitelisted: {whitelisted}
+â™» Duplicate Media: {duplicate_total}
+ðŸ“¦ Message Map Rows: {map_count}
+ðŸšª Join: {join_status}
         """
     )
 @bot.message_handler(commands=['info'])
@@ -1772,16 +1827,16 @@ def info_command(message):
     bot.send_message(
         message.chat.id,
         f"""
-👤 USER INFO
+ðŸ‘¤ USER INFO
 
-🆔 ID: {user_id}
-🏷 Username: {username}
-📸 Activation Media: {act_count}
-📦 Total Media Sent: {total_media}
+ðŸ†” ID: {user_id}
+ðŸ· Username: {username}
+ðŸ“¸ Activation Media: {act_count}
+ðŸ“¦ Total Media Sent: {total_media}
 
-🚫 Manual Ban: {banned}
-⏳ Auto Ban: {auto_banned}
-⭐ Whitelisted: {whitelisted}
+ðŸš« Manual Ban: {banned}
+â³ Auto Ban: {auto_banned}
+â­ Whitelisted: {whitelisted}
         """
     )
 
@@ -1793,7 +1848,7 @@ def ban_command(message):
 
     target_id = None
 
-    # 🔹 1️⃣ If used as reply
+    # ðŸ”¹ 1ï¸âƒ£ If used as reply
     if message.reply_to_message:
         bot_msg_id = message.reply_to_message.message_id
         target_id = get_original_sender(bot_msg_id)
@@ -1802,7 +1857,7 @@ def ban_command(message):
             bot.send_message(message.chat.id, "User not found.")
             return
 
-    # 🔹 2️⃣ If used with ID
+    # ðŸ”¹ 2ï¸âƒ£ If used with ID
     else:
         parts = message.text.split()
 
@@ -1816,7 +1871,7 @@ def ban_command(message):
             bot.send_message(message.chat.id, "Invalid USER_ID.")
             return
 
-    # 🔒 Final validation
+    # ðŸ”’ Final validation
     if not user_exists(target_id):
         bot.send_message(message.chat.id, "User not found in database.")
         return
@@ -1829,7 +1884,7 @@ def ban_command(message):
 
     bot.send_message(
         message.chat.id,
-        f"🚫 User {target_id} banned."
+        f"ðŸš« User {target_id} banned."
     )
 @bot.message_handler(commands=['unban'])
 def unban_command(message):
@@ -1839,7 +1894,7 @@ def unban_command(message):
 
     target_id = None
 
-    # 🔹 1️⃣ If used as reply
+    # ðŸ”¹ 1ï¸âƒ£ If used as reply
     if message.reply_to_message:
         bot_msg_id = message.reply_to_message.message_id
         target_id = get_original_sender(bot_msg_id)
@@ -1848,7 +1903,7 @@ def unban_command(message):
             bot.send_message(message.chat.id, "User not found.")
             return
 
-    # 🔹 2️⃣ If used with ID
+    # ðŸ”¹ 2ï¸âƒ£ If used with ID
     else:
         parts = message.text.split()
 
@@ -1865,7 +1920,7 @@ def unban_command(message):
             bot.send_message(message.chat.id, "Invalid USER_ID.")
             return
 
-    # 🔍 Final validation
+    # ðŸ” Final validation
     if not user_exists(target_id):
         bot.send_message(message.chat.id, "User not found in database.")
         return
@@ -1874,7 +1929,7 @@ def unban_command(message):
 
     bot.send_message(
         message.chat.id,
-        f"✅ User {target_id} unbanned."
+        f"âœ… User {target_id} unbanned."
     )
 @bot.message_handler(commands=['addadmin'])
 def addadmin_command(message):
@@ -1951,7 +2006,7 @@ def whitelist_command(message):
 
     bot.send_message(
         message.chat.id,
-        f"⭐ User {target_id} added to whitelist."
+        f"â­ User {target_id} added to whitelist."
     )
 @bot.message_handler(commands=['unwhitelist'])
 def unwhitelist_command(message):
@@ -1975,7 +2030,7 @@ def unwhitelist_command(message):
 
     bot.send_message(
         message.chat.id,
-        f"❌ User {target_id} removed from whitelist."
+        f"âŒ User {target_id} removed from whitelist."
     )
 @bot.message_handler(commands=['closebot'])
 def closebot_command(message):
@@ -2002,49 +2057,52 @@ def admin_menu(message):
     bot.send_message(
         message.chat.id,
         """
-🛠 ADMIN COMMAND MENU
+ðŸ›  ADMIN COMMAND MENU
 
-📊 /stats  
-→ Show bot statistics
+ðŸ“Š /stats  
+â†’ Show bot statistics
 
-🔎 /info USER_ID  
-→ View user details
+ðŸ”Ž /info USER_ID  
+â†’ View user details
 
-🚫 /ban USER_ID  
-→ Manually ban user
+ðŸš« /ban USER_ID  
+â†’ Manually ban user
 
-✅ /unban USER_ID  
-→ Remove manual ban
+âœ… /unban USER_ID  
+â†’ Remove manual ban
 
-⭐ /whitelist USER_ID  
-→ Bypass activation/inactivity
+â­ /whitelist USER_ID  
+â†’ Bypass activation/inactivity
 
-❌ /unwhitelist USER_ID  
-→ Remove whitelist access
+âŒ /unwhitelist USER_ID  
+â†’ Remove whitelist access
 
-👑 /addadmin USER_ID  
-→ Add new admin
+ðŸ‘‘ /addadmin USER_ID  
+â†’ Add new admin
 
-🗑 /removeadmin USER_ID  
-→ Remove admin
+ðŸ—‘ /removeadmin USER_ID  
+â†’ Remove admin
 
-🚪 /openjoin  
-→ Allow new users to join
+ðŸšª /openjoin  
+â†’ Allow new users to join
 
-🔒 /closejoin  
-→ Stop new users from joining
+ðŸ”’ /closejoin  
+â†’ Stop new users from joining
 
-🧹 /clearmap  
-→ Clear message mapping table
+ðŸ§¹ /clearmap  
+â†’ Clear message mapping table
 
-📦 /addword WORD  
-→ Add banned word
+/apurgeall
+-> Delete all mapped user messages globally
 
-❌ /removeword WORD  
-→ Remove banned word
+ðŸ“¦ /addword WORD  
+â†’ Add banned word
 
-📃 /words  
-→ Show banned words list
+âŒ /removeword WORD  
+â†’ Remove banned word
+
+ðŸ“ƒ /words  
+â†’ Show banned words list
         """
     )
 @bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
@@ -2136,7 +2194,7 @@ def get_channel_id(message):
     bot.send_message(message.chat.id, f"Channel ID: {message.chat.id}")
 
 # =========================
-# 🚀 MAIN BOOT
+# ðŸš€ MAIN BOOT
 # =========================
 
 if __name__ == "__main__":
