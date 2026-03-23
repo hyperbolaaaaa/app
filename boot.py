@@ -143,12 +143,19 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS message_map (
                     bot_message_id BIGINT,
                     original_user_id BIGINT,
+                    original_message_id BIGINT,
                     receiver_id BIGINT,
                     created_at BIGINT
                 )
             """)
+            c.execute("""
+                ALTER TABLE message_map
+                ADD COLUMN IF NOT EXISTS original_message_id BIGINT
+            """)
             c.execute("CREATE INDEX IF NOT EXISTS idx_bot_msg ON message_map(bot_message_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_original_user ON message_map(original_user_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_original_msg ON message_map(original_message_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_original_pair ON message_map(original_user_id, original_message_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON message_map(created_at)")
 
             # =========================
@@ -227,32 +234,69 @@ def init_db():
 # =========================
 # 👤 USER EXISTENCE
 # =========================
-def delete_message_globally(bot_message_id):
-
+def delete_message_globally(receiver_id, bot_message_id):
     with get_connection() as conn:
         with conn.cursor() as c:
-            c.execute("""
-                SELECT receiver_id
+            c.execute(
+                """
+                SELECT original_user_id, original_message_id
                 FROM message_map
-                WHERE bot_message_id=%s
-            """, (bot_message_id,))
-            rows = c.fetchall()
+                WHERE receiver_id=%s AND bot_message_id=%s
+                LIMIT 1
+                """,
+                (receiver_id, bot_message_id),
+            )
+            key_row = c.fetchone()
+
+            if key_row and key_row[1] is not None:
+                original_user_id, original_message_id = key_row
+                c.execute(
+                    """
+                    SELECT receiver_id, bot_message_id
+                    FROM message_map
+                    WHERE original_user_id=%s AND original_message_id=%s
+                    """,
+                    (original_user_id, original_message_id),
+                )
+                rows = c.fetchall()
+            else:
+                # Fallback for very old rows saved before original_message_id existed.
+                c.execute(
+                    """
+                    SELECT receiver_id, bot_message_id
+                    FROM message_map
+                    WHERE bot_message_id=%s
+                    """,
+                    (bot_message_id,),
+                )
+                rows = c.fetchall()
 
     deleted_count = 0
-
-    for row in rows:
+    for target_receiver_id, target_bot_msg_id in rows:
         try:
-            bot.delete_message(row[0], bot_message_id)
+            bot.delete_message(target_receiver_id, target_bot_msg_id)
             deleted_count += 1
         except:
             pass
 
     with get_connection() as conn:
         with conn.cursor() as c:
-            c.execute("""
-                DELETE FROM message_map
-                WHERE bot_message_id=%s
-            """, (bot_message_id,))
+            if key_row and key_row[1] is not None:
+                c.execute(
+                    """
+                    DELETE FROM message_map
+                    WHERE original_user_id=%s AND original_message_id=%s
+                    """,
+                    (key_row[0], key_row[1]),
+                )
+            else:
+                c.execute(
+                    """
+                    DELETE FROM message_map
+                    WHERE bot_message_id=%s
+                    """,
+                    (bot_message_id,),
+                )
     return deleted_count
 def purge_user_messages(user_id):
 
@@ -1090,17 +1134,18 @@ def get_receivers_cached(force=False):
 # 📝 SAVE MESSAGE MAP
 # =========================
 
-def save_mapping(bot_msg_id, original_user_id, receiver_id):
+def save_mapping(bot_msg_id, original_user_id, original_message_id, receiver_id):
 
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute("""
                 INSERT INTO message_map
-                (bot_message_id, original_user_id, receiver_id, created_at)
-                VALUES (%s, %s, %s, %s)
+                (bot_message_id, original_user_id, original_message_id, receiver_id, created_at)
+                VALUES (%s, %s, %s, %s, %s)
             """, (
                 bot_msg_id,
                 original_user_id,
+                original_message_id,
                 receiver_id,
                 int(time.time())
             ))
@@ -1114,8 +1159,8 @@ def save_mappings(rows):
             c.executemany(
                 """
                 INSERT INTO message_map
-                (bot_message_id, original_user_id, receiver_id, created_at)
-                VALUES (%s, %s, %s, %s)
+                (bot_message_id, original_user_id, original_message_id, receiver_id, created_at)
+                VALUES (%s, %s, %s, %s, %s)
                 """,
                 rows,
             )
@@ -1234,7 +1279,7 @@ def _process_single(message):
             try:
                 sent = future.result()
                 if sent and store_mapping:
-                    mappings.append((sent.message_id, sender_id, user_id, now))
+                    mappings.append((sent.message_id, sender_id, message.message_id, user_id, now))
                     if len(mappings) >= MAP_INSERT_BATCH_SIZE:
                         save_mappings(mappings)
                         mappings.clear()
@@ -1258,31 +1303,34 @@ def _process_album(messages):
     if not receivers:
         return
     prefix = build_prefix(sender_id)
-    media_objects = []
+    media_items = []
     for index, msg in enumerate(messages):
         if msg.content_type == "photo":
-            media_objects.append(
+            media_items.append((
                 InputMediaPhoto(
                     media=msg.photo[-1].file_id,
                     caption=(prefix if index == 0 else None),
-                )
-            )
+                ),
+                msg.message_id,
+            ))
         elif msg.content_type == "video":
-            media_objects.append(
+            media_items.append((
                 InputMediaVideo(
                     media=msg.video.file_id,
                     caption=(prefix if index == 0 else None),
-                )
-            )
-    chunks = [media_objects[i:i+10] for i in range(0, len(media_objects), 10)]
+                ),
+                msg.message_id,
+            ))
+    chunks = [media_items[i:i+10] for i in range(0, len(media_items), 10)]
 
     def send_album_to_user(user_id):
         rows = []
         for chunk in chunks:
-            sent_msgs = bot.send_media_group(user_id, chunk)
+            chunk_media = [item[0] for item in chunk]
+            sent_msgs = bot.send_media_group(user_id, chunk_media)
             if store_mapping:
-                for sent in sent_msgs:
-                    rows.append((sent.message_id, sender_id, user_id, now))
+                for sent, original_message_id in zip(sent_msgs, [item[1] for item in chunk]):
+                    rows.append((sent.message_id, sender_id, original_message_id, user_id, now))
             if FORWARD_DELAY > 0:
                 time.sleep(FORWARD_DELAY)
         return rows
@@ -1507,7 +1555,7 @@ def delete_command(message):
 
     bot_msg_id = message.reply_to_message.message_id
 
-    deleted_count = delete_message_globally(bot_msg_id)
+    deleted_count = delete_message_globally(message.chat.id, bot_msg_id)
     if deleted_count == 0:
         bot.send_message(
             message.chat.id,
